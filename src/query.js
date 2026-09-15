@@ -7,14 +7,26 @@ const { VectorIndex } = require('./vectorIndex');
 const { embedText } = require('./embedder');
 const { getRepoBrainDir } = require('./config');
 
-async function search(rootDir, queryText, k = 10) {
+/**
+ * `deps` lets callers that already have an open store/index (context.js's
+ * multi-step assembly, the long-lived MCP server) reuse them instead of
+ * paying an open+close per call. Omit it (the CLI's usage) and behavior is
+ * exactly what it was before: open fresh, close when done.
+ */
+async function search(rootDir, queryText, k = 10, filters = {}, deps = {}) {
   const brainDir = getRepoBrainDir(rootDir);
-  const store = new GraphStore(brainDir);
-  const vectorIndex = new VectorIndex(brainDir);
+  const store = deps.store || new GraphStore(brainDir);
+  const vectorIndex = deps.vectorIndex || new VectorIndex(brainDir);
+  const shouldClose = !deps.store;
   try {
+    const { kind, ext } = filters;
+    const needsFilter = Boolean(kind || ext);
+    const fetchK = needsFilter ? Math.max(k * 4, 40) : k;
+
     const queryVec = await embedText(queryText);
-    const hits = vectorIndex.search(queryVec, k);
-    return hits.map((h) => {
+    const hits = vectorIndex.search(queryVec, fetchK);
+
+    let results = hits.map((h) => {
       const sym = store.getSymbolById(h.symbolId);
       if (!sym) return null;
       const file = store.getFileById(sym.file_id);
@@ -29,14 +41,20 @@ async function search(rootDir, queryText, k = 10) {
         score: h.score
       };
     }).filter(Boolean);
+
+    if (kind) results = results.filter((r) => r.kind === kind);
+    if (ext) results = results.filter((r) => r.path && r.path.endsWith(ext));
+
+    return results.slice(0, k);
   } finally {
-    store.close();
+    if (shouldClose) store.close();
   }
 }
 
-function expand(rootDir, symbolId, hops = 1) {
+function expand(rootDir, symbolId, hops = 1, deps = {}) {
   const brainDir = getRepoBrainDir(rootDir);
-  const store = new GraphStore(brainDir);
+  const store = deps.store || new GraphStore(brainDir);
+  const shouldClose = !deps.store;
   try {
     const related = store.expand(Number(symbolId), Number(hops));
     return related.map((r) => ({
@@ -49,7 +67,7 @@ function expand(rootDir, symbolId, hops = 1) {
       endLine: r.symbol ? r.symbol.end_line : null
     }));
   } finally {
-    store.close();
+    if (shouldClose) store.close();
   }
 }
 
@@ -62,4 +80,41 @@ function read(rootDir, relPath, startLine, endLine) {
   return lines.slice(s - 1, e).join('\n');
 }
 
-module.exports = { search, expand, read };
+/**
+ * Pre-edit safety report for a symbol: who transitively calls it (blast
+ * radius) and which tests, if any, exercise it - so an agent can gauge risk
+ * before changing it instead of finding out after the fact.
+ */
+function check(rootDir, symbolId, opts = {}, deps = {}) {
+  const { hops = 3, testHops = 6 } = opts;
+  const brainDir = getRepoBrainDir(rootDir);
+  const store = deps.store || new GraphStore(brainDir);
+  const shouldClose = !deps.store;
+  try {
+    const id = Number(symbolId);
+    const symbol = store.getSymbolById(id);
+    if (!symbol) return null;
+    const file = store.getFileById(symbol.file_id);
+
+    const blastRadius = store.getCallers(id, Number(hops));
+    const testsCovering = store.getTestsForSymbol(id, Number(testHops));
+
+    return {
+      symbol: {
+        symbolId: symbol.id,
+        name: symbol.name,
+        kind: symbol.kind,
+        path: file ? file.path : null,
+        startLine: symbol.start_line,
+        endLine: symbol.end_line
+      },
+      blastRadius,
+      testsCovering,
+      risk: testsCovering.length > 0 ? 'covered' : 'untested'
+    };
+  } finally {
+    if (shouldClose) store.close();
+  }
+}
+
+module.exports = { search, expand, read, check };

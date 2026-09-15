@@ -58,6 +58,12 @@ class VectorIndex {
     this.vectors = newVectors;
   }
 
+  /** Drops every vector - used by a `--force` rebuild, which promises to rebuild from scratch. */
+  clear() {
+    this.ids = [];
+    this.vectors = new Float32Array(0);
+  }
+
   addBatch(idVectorPairs) {
     const extra = new Float32Array(idVectorPairs.length * EMBEDDING_DIM);
     idVectorPairs.forEach(([id, vec], i) => {

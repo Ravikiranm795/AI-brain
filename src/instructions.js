@@ -24,23 +24,37 @@ instead - it is faster and always current after a rebuild.
 
 Run these from a terminal at the root of this repo (or any subfolder):
 
+- \`brain context "<task description>"\` - the recommended starting point.
+  Does search + expand + read in one call and returns a ready-to-use,
+  budget-bounded bundle of the most relevant code plus its callers/callees.
 - \`brain search "<what you're looking for>"\` - semantic search over
-  functions/classes, returns exact file + line ranges.
+  functions/classes, returns exact file + line ranges (use this directly,
+  instead of \`context\`, when you want to control expansion/budget yourself).
 - \`brain expand <symbolId> --hops 1\` - get callers/callees of a symbol
   returned by search.
 - \`brain read <path> <startLine> <endLine>\` - read only that exact slice of
   a file, instead of opening the whole file.
+- \`brain check <symbolId>\` - before editing something: reports its blast
+  radius (transitive callers) and whether any test covers it.
 - \`brain build\` - re-run after making changes. It is incremental: only
   files whose content actually changed are re-parsed and re-embedded, so
-  repeat runs on an already-indexed repo are fast.
+  repeat runs on an already-indexed repo are fast. Add \`--force\` to rebuild
+  from scratch, or \`--precise\` to also resolve TS/JS calls via a real
+  language server if one is installed (see the project's README §7).
+
+If you connect to this tool as an MCP server instead of a shell (\`brain mcp\`
+/ \`brain-mcp\`), the same capabilities are available as \`brain_search\`,
+\`brain_expand\`, \`brain_read\`, \`brain_context\`, \`brain_check\`, \`brain_build\`,
+\`brain_list\` tools - use those directly rather than shelling out, if available.
 
 ## Recommended agent workflow
 
-1. \`brain search "<task description>"\` to find the relevant starting points.
-2. \`brain expand <symbolId>\` on the top hits to see what calls them / what
-   they call, for context before editing.
-3. \`brain read <path> <start> <end>\` to pull only the exact code needed.
-4. After making edits, run \`brain build\` once before finishing the task so
+1. \`brain context "<task description>"\` to gather relevant code + its
+   immediate neighborhood in one call. Fall back to \`brain search\` +
+   \`brain expand\` + \`brain read\` individually when you need finer control.
+2. Before editing a symbol found this way, run \`brain check <symbolId>\` to
+   see what depends on it and whether it's tested.
+3. After making edits, run \`brain build\` once before finishing the task so
    the brain reflects the new state of the repo for the next session.
 
 Repo id: \`${repoId}\`
