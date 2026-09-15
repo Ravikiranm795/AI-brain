@@ -58,7 +58,23 @@ function listAllRepoBrains() {
     });
 }
 
-const SUPPORTED_EXTENSIONS = new Set(['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.java']);
+// Languages with real tree-sitter symbol/call extraction (see src/parser.js).
+const FULLY_PARSED_EXTENSIONS = ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.java', '.py', '.pyw'];
+
+// Everything else: still walked, hashed, and embedded (so it's searchable and
+// shows up in the brain), but indexed as a single whole-file chunk rather
+// than fine-grained functions/classes - see parseGenericFile in parser.js.
+const GENERICALLY_PARSED_EXTENSIONS = [
+  '.html', '.htm', '.css', '.scss', '.sass', '.less', '.vue', '.svelte',
+  '.ex', '.exs', '.rb', '.go', '.rs',
+  '.c', '.h', '.cpp', '.cc', '.cxx', '.hpp', '.hh',
+  '.cs', '.php', '.kt', '.kts', '.swift', '.scala', '.dart',
+  '.sh', '.bash', '.zsh', '.sql', '.pl', '.pm', '.lua', '.m', '.mm',
+  '.groovy', '.hs', '.clj', '.cljs', '.graphql', '.gql', '.tf', '.fs', '.fsx',
+  '.vb', '.r', '.elm'
+];
+
+const SUPPORTED_EXTENSIONS = new Set([...FULLY_PARSED_EXTENSIONS, ...GENERICALLY_PARSED_EXTENSIONS]);
 
 const DEFAULT_IGNORE_DIRS = [
   'node_modules',
@@ -81,5 +97,6 @@ module.exports = {
   getRepoBrainDir,
   listAllRepoBrains,
   SUPPORTED_EXTENSIONS,
+  FULLY_PARSED_EXTENSIONS,
   DEFAULT_IGNORE_DIRS
 };

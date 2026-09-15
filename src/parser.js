@@ -1,28 +1,29 @@
 'use strict';
 
 const fs = require('fs');
+const path = require('path');
 const Parser = require('tree-sitter');
 const JavaScript = require('tree-sitter-javascript');
 const TypeScript = require('tree-sitter-typescript').typescript;
 const TSX = require('tree-sitter-typescript').tsx;
 const Java = require('tree-sitter-java');
+const Python = require('tree-sitter-python');
 
-function languageFor(ext) {
-  switch (ext) {
-    case '.ts':
-      return TypeScript;
-    case '.tsx':
-      return TSX;
-    case '.java':
-      return Java;
-    case '.jsx':
-    case '.js':
-    case '.mjs':
-    case '.cjs':
-    default:
-      return JavaScript;
-  }
-}
+// Extensions with a real tree-sitter grammar wired into the visitor below.
+// Anything else falls back to parseGenericFile (whole-file chunk, no
+// fine-grained symbols) - see SUPPORTED_EXTENSIONS/GENERICALLY_PARSED_EXTENSIONS
+// in config.js for the full list of extensions the walker will pick up.
+const LANGUAGES_BY_EXT = {
+  '.js': JavaScript,
+  '.jsx': JavaScript,
+  '.mjs': JavaScript,
+  '.cjs': JavaScript,
+  '.ts': TypeScript,
+  '.tsx': TSX,
+  '.java': Java,
+  '.py': Python,
+  '.pyw': Python
+};
 
 /**
  * Parses a single file and returns:
@@ -32,8 +33,14 @@ function languageFor(ext) {
  */
 function parseFile(absPath, ext, source) {
   const code = source !== undefined ? source : fs.readFileSync(absPath, 'utf8');
+
+  const language = LANGUAGES_BY_EXT[ext];
+  if (!language) {
+    return parseGenericFile(absPath, code);
+  }
+
   const parser = new Parser();
-  parser.setLanguage(languageFor(ext));
+  parser.setLanguage(language);
 
   let tree;
   try {
@@ -99,6 +106,69 @@ function parseFile(absPath, ext, source) {
         for (const child of node.namedChildren) visit(child);
         return;
       }
+      // Python: function_definition covers both top-level functions and
+      // methods (there's no separate method_definition node type like JS) -
+      // it's a method only when its immediate containing block belongs to a
+      // class_definition (walking through decorated_definition wrappers).
+      case 'function_definition': {
+        const nameNode = node.childForFieldName('name');
+        const name = nameNode ? nameNode.text : '(anonymous)';
+        let container = node.parent;
+        while (container && container.type === 'decorated_definition') container = container.parent;
+        const isMethod = !!(container && container.type === 'block' && container.parent && container.parent.type === 'class_definition');
+        const sym = pushSymbol(node, name, isMethod ? 'method' : 'function');
+        scopeStack.push(sym);
+        for (const child of node.namedChildren) visit(child);
+        scopeStack.pop();
+        return;
+      }
+      case 'class_definition': {
+        const nameNode = node.childForFieldName('name');
+        const name = nameNode ? nameNode.text : '(anonymous class)';
+        pushSymbol(node, name, 'class');
+        for (const child of node.namedChildren) visit(child);
+        return;
+      }
+      // Python: `from a.b import c` - childForFieldName('name') isn't set
+      // (only plain `import a.b.c` uses it), so read children positionally.
+      // Imported names come as plain `dotted_name` (`c`) or, for `c as d`,
+      // an `aliased_import` wrapping a `dotted_name` under its 'name' field.
+      case 'import_from_statement': {
+        const moduleNode = node.namedChildren.find(
+          (c) => c.type === 'dotted_name' || c.type === 'relative_import'
+        );
+        const specifier = moduleNode ? moduleNode.text : null;
+        const names = [];
+        for (const c of node.namedChildren) {
+          if (c === moduleNode) continue;
+          if (c.type === 'dotted_name') names.push(c.text);
+          else if (c.type === 'aliased_import') {
+            const n = c.childForFieldName('name');
+            if (n) names.push(n.text);
+          }
+        }
+        if (specifier) imports.push({ specifier, names });
+        break;
+      }
+      // Python: `call` is the equivalent of JS's call_expression; the callee
+      // is either a bare identifier or an `attribute` (obj.method()), where
+      // JS instead has member_expression/property.
+      case 'call': {
+        const fnNode = node.childForFieldName('function');
+        let calleeName = null;
+        if (fnNode) {
+          if (fnNode.type === 'identifier') calleeName = fnNode.text;
+          else if (fnNode.type === 'attribute') {
+            const attr = fnNode.childForFieldName('attribute');
+            if (attr) calleeName = attr.text;
+          }
+        }
+        const scope = currentScope();
+        if (calleeName && scope) {
+          calls.push({ callerName: scope.name, calleeName, line: node.startPosition.row + 1 });
+        }
+        break;
+      }
       // Java: interfaces have no direct JS/TS equivalent in this schema's
       // symbol kinds, so they're tracked as 'class' - same as JS classes,
       // good enough for "what's declared here / what calls into it" nav.
@@ -149,9 +219,20 @@ function parseFile(absPath, ext, source) {
         }
         break;
       }
+      // Python also has a node type called `import_statement` (plain
+      // `import a.b.c`), distinguished here by having no `source` field.
       case 'import_statement': {
         const sourceNode = node.childForFieldName('source');
-        const specifier = sourceNode ? sourceNode.text.replace(/^['"]|['"]$/g, '') : null;
+        if (!sourceNode) {
+          for (const c of node.namedChildren) {
+            const target = c.type === 'aliased_import' ? c.childForFieldName('name') : c;
+            if (target && (target.type === 'dotted_name' || target.type === 'identifier')) {
+              imports.push({ specifier: target.text, names: [] });
+            }
+          }
+          break;
+        }
+        const specifier = sourceNode.text.replace(/^['"]|['"]$/g, '');
         const names = [];
         const clause = node.namedChildren.find((c) => c.type === 'import_clause');
         if (clause) {
@@ -205,6 +286,34 @@ function parseFile(absPath, ext, source) {
   visit(tree.rootNode);
 
   return { symbols, imports, calls };
+}
+
+/**
+ * Fallback for extensions without a tree-sitter grammar wired up above
+ * (html, css, go, rb, exs, ...). No AST, so no function/class-level
+ * symbols or call graph - the whole file becomes one 'file'-kind symbol so
+ * it's still hashed, embedded, and searchable like everything else.
+ */
+function parseGenericFile(absPath, code) {
+  const lines = code.split('\n');
+  const name = path.basename(absPath);
+  const firstLine = (lines.find((l) => l.trim()) || name).trim();
+
+  return {
+    symbols: [
+      {
+        name,
+        kind: 'file',
+        startLine: 1,
+        endLine: lines.length,
+        startByte: 0,
+        endByte: code.length,
+        signature: firstLine.slice(0, 160)
+      }
+    ],
+    imports: [],
+    calls: []
+  };
 }
 
 module.exports = { parseFile };

@@ -1,3 +1,5 @@
 node_modules/
 *.log
 brain-graph.html
+brain-graph-radial.html
+BRAIN-INSTRUCTIONS.md

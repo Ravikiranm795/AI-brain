@@ -749,7 +749,7 @@ function buildFileFilters() {
     row.className = 'chk-row';
     row.title = f;
     row.innerHTML = '<input type="checkbox" checked data-file="' + escapeAttr(f) + '" />' +
-      '<span class="lbl">' + shortenPath(f) + '</span><span class="cnt">' + count + '</span>';
+      '<span class="lbl">' + escapeHtml(shortenPath(f)) + '</span><span class="cnt">' + count + '</span>';
     row.querySelector('input').addEventListener('change', (e) => {
       toggleSetVal(filters.files, f, e.target.checked);
       applyFilters();
@@ -806,7 +806,7 @@ function buildLegend() {
 }
 
 function toggleSetVal(set, val, on) { if (on) set.add(val); else set.delete(val); }
-function escapeAttr(s) { return s.replace(/"/g, '&quot;'); }
+function escapeAttr(s) { return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;'); }
 function shortenPath(p) { return p.length > 34 ? '...' + p.slice(-31) : p; }
 
 /* ---------------- active filter chips ---------------- */
@@ -1260,14 +1260,14 @@ function renderRelationshipsTab(node) {
 
 function connRowHtml(otherNode, dirArrow) {
   const dd = otherNode.data();
-  return '<div class="conn-item" data-id="' + dd.id + '">' +
+  return '<div class="conn-item" data-id="' + escapeAttr(dd.id) + '">' +
     '<span class="dir">' + dirArrow + '</span>' +
     '<span class="swatch" style="background:' + colorForKind(dd.kind) + '"></span>' +
     '<span class="n">' + escapeHtml(dd.label) + '</span>' +
-    '<span class="p">' + shortenPath(dd.path) + '</span></div>';
+    '<span class="p">' + escapeHtml(shortenPath(dd.path)) + '</span></div>';
 }
 
-function escapeHtml(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function escapeHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 
 /* ---------------- depth-based expand / collapse (uses real edges already in the exported graph) ---------------- */
 document.querySelectorAll('#depthControl button').forEach((btn) => {
@@ -1361,7 +1361,7 @@ searchBox.addEventListener('input', () => {
       const row = document.createElement('div');
       row.className = 'res-item';
       row.innerHTML = '<span class="k" style="background:' + colorForKind(n.kind) + '"></span>' +
-        '<span class="n">' + escapeHtml(n.label) + '</span><span class="p">' + shortenPath(n.path) + '</span>';
+        '<span class="n">' + escapeHtml(n.label) + '</span><span class="p">' + escapeHtml(shortenPath(n.path)) + '</span>';
       row.addEventListener('click', () => {
         searchResults.classList.remove('open');
         searchBox.value = n.label;
