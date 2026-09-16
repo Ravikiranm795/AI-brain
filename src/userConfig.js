@@ -14,10 +14,12 @@ const path = require('path');
  * Recognized keys (all optional):
  *   ignoreDirs         string[] - directory names ADDED to DEFAULT_IGNORE_DIRS
  *   extraExtensions    string[] - file extensions ADDED to SUPPORTED_EXTENSIONS (e.g. [".mts"])
- *   defaultBudgetChars number   - overrides context.js's DEFAULT_BUDGET_CHARS
- *   maxItems           number   - overrides context.js's MAX_ITEMS
- *   maxOpen            number   - overrides storeCache.js's MAX_OPEN
- *   rrfK               number   - overrides query.js's RRF_K hybrid-search fusion constant
+ *   defaultBudgetChars   number - overrides context.js's DEFAULT_BUDGET_CHARS (a hard cap on total response size, not just code)
+ *   maxItems             number - overrides context.js's MAX_ITEMS
+ *   minNeighborSimilarity number - overrides context.js's DEFAULT_MIN_NEIGHBOR_SIMILARITY (-1 disables neighbor relevance filtering entirely)
+ *   minGuaranteedNeighbors number - overrides context.js's MIN_GUARANTEED_NEIGHBORS (top-N neighbors by similarity kept regardless of the floor above)
+ *   maxOpen              number - overrides storeCache.js's MAX_OPEN
+ *   rrfK                 number - overrides query.js's DEFAULT_RRF_K hybrid-search fusion constant
  */
 function readConfigFile(p) {
   if (!p || !fs.existsSync(p)) return null;

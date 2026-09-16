@@ -5,8 +5,23 @@ const path = require('path');
 const { GraphStore } = require('./graphStore');
 const { VectorIndex } = require('./vectorIndex');
 const { embedText } = require('./embedder');
-const { getRepoBrainDir, getBrainsHome } = require('./config');
+const { getRepoBrainDir, getBrainsHome, FULLY_PARSED_EXTENSIONS } = require('./config');
 const { loadUserConfig } = require('./userConfig');
+
+const FULLY_PARSED_EXTENSION_SET = new Set(FULLY_PARSED_EXTENSIONS);
+// Applied to a generic-parsed-file symbol's (see parser.js's
+// parseGenericFile - no real logic granularity, whole file as one symbol)
+// TOTAL fused score, unless it earned a genuine lexical hit against its
+// actual body content. Two of the three signals can otherwise let a
+// filename coincidence alone win: the name-match signal (see
+// graphStore.js's searchByNameMatch, which discounts itself at the source)
+// and, more subtly, the semantic signal - a generic-file symbol's `name` IS
+// its filename (see buildBrain.js's embed text), so its embedding already
+// has the filename baked in, unlike a real code symbol whose name is an
+// identifier, not the file it lives in. Without this, a "theme.scss" can
+// tie or outrank a real "ThemeService" class for a "theme" query even after
+// the name-match signal alone is fixed.
+const GENERIC_FILE_SCORE_DISCOUNT = 0.5;
 
 // Reciprocal-rank-fusion constant: standard choice (see Cormack et al.'s RRF
 // paper), not tuned for this corpus - low sensitivity to the exact value is
@@ -49,25 +64,49 @@ async function search(rootDir, queryText, k = 10, filters = {}, deps = {}) {
     const queryVec = await embedText(queryText);
     const semanticHits = vectorIndex.search(queryVec, fetchK);
     const lexicalHits = store.searchLexical(queryText, fetchK);
+    // Third signal: does the query match the symbol's own name or its
+    // file's path/basename? Neither of the other two signals looks at names
+    // specifically - see graphStore.js's searchByNameMatch() doc comment.
+    // This is what makes a file named near-exactly for the query (e.g.
+    // `generic-filter.component.ts` for "filter flow") a reliable hit even
+    // when its body content isn't semantically/lexically close to the
+    // query wording.
+    const nameHits = store.searchByNameMatch(queryText, fetchK);
 
-    const fused = new Map(); // symbolId -> { score, matches }
-    const addHit = (id, rank) => {
-      const cur = fused.get(id) || { score: 0, matches: 0 };
+    const fused = new Map(); // symbolId -> { score, matches, hasLexicalHit }
+    const addHit = (id, rank, isLexical) => {
+      const cur = fused.get(id) || { score: 0, matches: 0, hasLexicalHit: false };
       cur.score += 1 / (rrfK + rank + 1);
       cur.matches += 1;
+      if (isLexical) cur.hasLexicalHit = true;
       fused.set(id, cur);
     };
-    semanticHits.forEach((h, i) => addHit(h.symbolId, i));
-    lexicalHits.forEach((h, i) => addHit(h.symbolId, i));
+    semanticHits.forEach((h, i) => addHit(h.symbolId, i, false));
+    lexicalHits.forEach((h, i) => addHit(h.symbolId, i, true));
+    nameHits.forEach((h, i) => addHit(h.symbolId, i, false));
+
+    // See GENERIC_FILE_SCORE_DISCOUNT above: a generic-parsed-file symbol
+    // without a real lexical hit against its actual content only got here
+    // via filename-driven signals, so its total score is discounted before
+    // the final sort - done here (post-fusion), not per-signal, so it
+    // reads directly off `hasLexicalHit` instead of duplicating that
+    // reasoning at each addHit() call site.
+    for (const [symbolId, entry] of fused) {
+      if (entry.hasLexicalHit) continue;
+      const sym = store.getSymbolById(symbolId);
+      const file = sym ? store.getFileById(sym.file_id) : null;
+      const ext = file ? path.extname(file.path).toLowerCase() : null;
+      if (ext && !FULLY_PARSED_EXTENSION_SET.has(ext)) entry.score *= GENERIC_FILE_SCORE_DISCOUNT;
+    }
 
     const ranked = [...fused.entries()].sort((a, b) => b[1].score - a[1].score).slice(0, fetchK);
 
     // score is now an RRF-fused rank score, not a raw cosine similarity -
     // see the RRF_K comment above and README §10 for what it means and why.
     // `confidence` buckets it into something more actionable than the raw
-    // number: 'high' when both the semantic and lexical searches agreed on
-    // this result, 'medium'/'low' otherwise based on how high it ranked in
-    // whichever single list found it.
+    // number: 'high' when at least two of the three search signals (semantic,
+    // lexical, name) agreed on this result, 'medium'/'low' otherwise based on
+    // how high it ranked in whichever single list found it.
     let results = ranked.map(([symbolId, { score, matches }]) => {
       const sym = store.getSymbolById(symbolId);
       if (!sym) return null;

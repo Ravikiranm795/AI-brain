@@ -2,7 +2,28 @@
 
 const path = require('path');
 const Database = require('better-sqlite3');
-const { isTestFile } = require('./config');
+const { isTestFile, FULLY_PARSED_EXTENSIONS } = require('./config');
+
+const FULLY_PARSED_EXTENSION_SET = new Set(FULLY_PARSED_EXTENSIONS);
+// A generic-parsed file (.scss/.html/.json/...) has no real logic
+// granularity - it's indexed as one whole-file symbol (see parser.js's
+// parseGenericFile) rather than real functions/classes. Halving its
+// name-match score keeps a filename coincidence there (a stylesheet named
+// "theme.scss" for a "theme" query) from outranking an actual .ts/.js
+// logic file with the same or a weaker token match.
+const GENERIC_FILE_NAME_MATCH_DISCOUNT = 0.5;
+
+// Splits a file path or symbol name into lowercase word tokens, aware of
+// kebab-case, snake_case, camelCase and path/extension separators - so
+// "generic-filter.component.ts" tokenizes to [generic, filter, component,
+// ts] and matches a query like "filter flow" on the "filter" token. Used by
+// GraphStore.searchByNameMatch() below.
+function tokenizeForNameMatch(text) {
+  return (text.match(/[A-Za-z0-9]+/g) || [])
+    .flatMap((chunk) => chunk.replace(/([a-z0-9])([A-Z])/g, '$1 $2').split(/[\s_-]+/))
+    .map((t) => t.toLowerCase())
+    .filter(Boolean);
+}
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS files (
@@ -285,6 +306,78 @@ class GraphStore {
     } catch (_) {
       return []; // malformed FTS query (e.g. all-punctuation input) - degrade to semantic-only rather than fail the whole search
     }
+  }
+
+  /**
+   * Third search signal alongside vectorIndex's semantic search and
+   * searchLexical's FTS5 body search: how well the query matches a symbol's
+   * OWN name or its file's path/basename - neither of the other two signals
+   * looks at names specifically (semantic search embeds the signature text;
+   * FTS5 indexes the body). Without this, a file whose name is an
+   * near-exact match for the query (e.g. `generic-filter.component.ts` for
+   * "filter flow") can rank poorly if its body content doesn't happen to be
+   * semantically/lexically close to the query wording.
+   *
+   * Scored in JS, not SQL: an exact whole-token match on the file's
+   * basename or the symbol's own name counts for more than a bare substring
+   * match, and files are considered once (all real work is at file
+   * granularity - path tokens don't vary per symbol), with the file's
+   * representative symbol (prefer a class/file-kind symbol, else the
+   * earliest-declared one) standing in for it in the result.
+   */
+  searchByNameMatch(queryText, limit = 40) {
+    const queryTokens = new Set(tokenizeForNameMatch(queryText));
+    if (!queryTokens.size) return [];
+
+    const files = this.db.prepare('SELECT id, path FROM files').all();
+    const scored = [];
+    for (const f of files) {
+      const base = path.basename(f.path);
+      const baseTokens = new Set(tokenizeForNameMatch(base));
+      const baseLower = base.toLowerCase();
+      let score = 0;
+      for (const t of queryTokens) {
+        if (baseTokens.has(t)) score += 2; // exact token match
+        else if (t.length >= 3 && baseLower.includes(t)) score += 1; // substring match (skip tiny tokens - too noisy as substrings)
+      }
+      if (score > 0 && !FULLY_PARSED_EXTENSION_SET.has(path.extname(f.path).toLowerCase())) {
+        score *= GENERIC_FILE_NAME_MATCH_DISCOUNT;
+      }
+      if (score > 0) scored.push({ fileId: f.id, score });
+    }
+    if (!scored.length) return [];
+    scored.sort((a, b) => b.score - a.score);
+
+    // Pick which symbol in each matched file represents it: the one whose
+    // OWN name best matches the query tokens, if any does, otherwise the
+    // file's "main" symbol (a class/file-kind symbol, else whichever is
+    // declared first) - bounded to symbols within already-matched files, not
+    // a full symbol-table scan.
+    const fileSymbols = this.db.prepare('SELECT id, name, kind, start_line FROM symbols WHERE file_id = ?');
+    const results = [];
+    for (const s of scored.slice(0, limit)) {
+      const syms = fileSymbols.all(s.fileId);
+      if (!syms.length) continue;
+      let best = null;
+      let bestScore = -Infinity;
+      for (const sym of syms) {
+        const nameTokens = new Set(tokenizeForNameMatch(sym.name));
+        let nameScore = 0;
+        for (const t of queryTokens) {
+          if (nameTokens.has(t)) nameScore += 2;
+        }
+        const kindBonus = sym.kind === 'class' || sym.kind === 'file' ? 0.5 : 0;
+        const orderBonus = -sym.start_line * 1e-6; // tie-break toward earlier declarations, doesn't affect real distinctions
+        const total = nameScore + kindBonus + orderBonus;
+        if (total > bestScore) {
+          bestScore = total;
+          best = sym;
+        }
+      }
+      if (best) results.push({ symbolId: best.id, score: s.score + Math.max(0, bestScore) });
+    }
+    results.sort((a, b) => b.score - a.score);
+    return results;
   }
 
   /**

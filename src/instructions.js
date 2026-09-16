@@ -47,6 +47,12 @@ If you connect to this tool as an MCP server instead of a shell (\`brain mcp\`
 \`brain_expand\`, \`brain_read\`, \`brain_context\`, \`brain_check\`, \`brain_build\`,
 \`brain_list\` tools - use those directly rather than shelling out, if available.
 
+**Latency note**: each CLI invocation above is a fresh process that pays a
+one-time cost (~1.5-4+s) to load the local embedding model before it does
+anything else. The MCP server pays that cost once on its first call, then
+serves everything after in tens/low hundreds of milliseconds - prefer it
+over shelling out when you're calling this more than once or twice.
+
 ## Recommended agent workflow
 
 1. \`brain context "<task description>"\` to gather relevant code + its

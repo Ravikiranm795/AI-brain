@@ -134,12 +134,14 @@ Drop a `brain.config.json` at a repo's root (repo-specific) and/or at `BRAIN_HOM
   "extraExtensions": [".mts"],
   "defaultBudgetChars": 40000,
   "maxItems": 100,
+  "minNeighborSimilarity": 0.2,
+  "minGuaranteedNeighbors": 5,
   "maxOpen": 10,
   "rrfK": 60
 }
 ```
 
-All keys are optional. `ignoreDirs`/`extraExtensions` are *added* to the built-in lists (not a replacement), so a typo can't accidentally un-ignore `node_modules`. `maxOpen` (StoreCache's LRU cap on open repos) only makes sense machine-wide, so it's only read from `BRAIN_HOME`'s config, not a repo-level one. See `src/userConfig.js` for the full list.
+All keys are optional. `ignoreDirs`/`extraExtensions` are *added* to the built-in lists (not a replacement), so a typo can't accidentally un-ignore `node_modules`. `maxOpen` (StoreCache's LRU cap on open repos) only makes sense machine-wide, so it's only read from `BRAIN_HOME`'s config, not a repo-level one. `minNeighborSimilarity` tunes how aggressively `brain context` filters graph-adjacent-but-topically-unrelated neighbors (see §3); set it to `-1` to disable that filtering entirely and go back to including every graph-adjacent neighbor up to `maxItems`. `minGuaranteedNeighbors` (default 5) is a backstop on top of that floor — the top N neighbors by similarity are always kept regardless of `minNeighborSimilarity`, so a task whose whole neighborhood happens to embed poorly doesn't lose its graph context entirely. See `src/userConfig.js` for the full list.
 
 ### Multi-repo
 
@@ -168,14 +170,14 @@ Returns JSON shaped like:
   "task": "...",
   "budget": { "limitChars": 24000, "usedChars": 18342, "truncated": false },
   "primary": [ { "symbolId": 42, "name": "chargeCard", "kind": "function", "path": "src/payments.js", "startLine": 12, "endLine": 40, "score": 0.81, "signature": "...", "code": "..." } ],
-  "neighbors": [ { "symbolId": 51, "relation": "caller", "via": 42, "name": "...", "path": "...", "code": null } ],
+  "neighbors": [ { "symbolId": 51, "relation": "caller", "via": 42, "name": "...", "path": "...", "code": null, "similarity": 0.34 } ],
   "filesTouched": ["src/payments.js", "src/webhook.js"],
   "notes": []
 }
 ```
 
-- The most relevant hits (by semantic search) get **real source code** (read from the file, not the ~160-char truncated signature stored for search preview), up to a character budget (default 24,000 ≈ 6k tokens, tune with `--budget`).
-- Their immediate callers/callees come along as `neighbors`, prioritized by distance — closer neighbors get real code while budget remains, farther ones get just their location/signature.
+- The most relevant hits (by semantic search) get **real source code** (read from the file, not the ~160-char truncated signature stored for search preview), up to `budget.limitChars` (default 24,000 ≈ 6k tokens, tune with `--budget`) — which bounds the **entire response**, not just code text. If it's still too big once neighbors' metadata is accounted for, the lowest-priority neighbors are dropped first; if it's *still* over (e.g. a single large primary hit's own metadata already approaches the budget), primary code is shrunk further rather than dropped outright, until it fits or there's nothing left to shrink. Either way, `budget.usedChars` always reflects the true final size and `notes` explains what happened.
+- Their immediate callers/callees come along as `neighbors`, prioritized by distance and, within a distance tier, by **relevance to the task text** — a graph-adjacent neighbor whose embedding similarity to the task falls below a floor (default 0.1, tune via `brain.config.json`'s `minNeighborSimilarity`) is dropped rather than riding along just because it's structurally adjacent (this is what keeps an unrelated `*.spec.ts`/`*.scss` neighbor out). Two exceptions, so this can't zero out a context bundle's graph entirely: a `"shares-storage-key"` neighbor (see §4) is never dropped (that relation is itself an explicit relevance signal), and the top `minGuaranteedNeighbors` (default 5) by similarity are always kept regardless of the floor.
 - `--kind`/`--ext` filter the primary hits the same way `brain search` does.
 
 This is the recommended default entry point for a new task — use the raw `search`/`expand`/`read` primitives when you need finer control instead.
@@ -238,6 +240,8 @@ claude mcp add --scope user brain-mcp -- brain-mcp
 ```
 
 This exposes 7 tools with the exact same behavior as the CLI commands above — `brain_search`, `brain_expand`, `brain_read`, `brain_context`, `brain_check`, `brain_build`, `brain_list` — as typed tool calls instead of shell-and-parse-JSON. It also keeps the graph/vector index open across calls (faster than the CLI's per-invocation open/close) and remembers within the session what code it's already shown you, so a repeated `brain_read`/`brain_context` on the same lines comes back flagged `alreadyShown` instead of resending the same text.
+
+**A note on latency, so you don't benchmark the wrong number**: every CLI invocation (`brain search`, `brain context`, ...) is a fresh Node process, and most of what it pays for is loading the local embedding model (ONNX runtime) from scratch — typically 1.5-4+ seconds depending on the machine, dominating whatever the actual query took. The MCP server pays that cost exactly **once**, on its first tool call after starting, and every call after that is warm — typically tens to a couple hundred milliseconds. If you're evaluating how fast this is, benchmark repeated calls through `brain mcp`/`brain-mcp`, not a single `brain search` invocation — the latter will make it look ~10-50x slower than it actually is in normal (server) use.
 
 **This is purely additive** — every CLI command above keeps working exactly as documented, with or without the MCP server running. `brain mcp` (equivalent to the standalone `brain-mcp` binary) is just a second way to reach the same logic.
 
@@ -335,10 +339,14 @@ Beyond `.gitignore` and `DEFAULT_IGNORE_DIRS` (`node_modules`, `.git`, `dist`, `
 
 ## 10. `brain search` result scoring
 
-Each result's `score` is a [reciprocal-rank-fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf) score combining two independent rankings: `vectorIndex.js`'s semantic (embedding cosine) search, and a lexical/substring search over full symbol bodies via SQLite FTS5 (`chunks_fts` in `graph.sqlite`) — so an exact identifier or string literal that only appears inside a function body (not just its first line) still surfaces, even with zero semantic similarity to the query text.
+Each result's `score` is a [reciprocal-rank-fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf) score combining three independent rankings:
+1. `vectorIndex.js`'s **semantic** search (embedding cosine similarity).
+2. A **lexical**/substring search over full symbol bodies via SQLite FTS5 (`chunks_fts` in `graph.sqlite`) — so an exact identifier or string literal that only appears inside a function body (not just its first line) still surfaces, even with zero semantic similarity to the query text.
+3. A **name-match** search (`graphStore.js`'s `searchByNameMatch`) over symbol names and file paths/basenames — so a file whose name is a near-exact match for the query (e.g. `generic-filter.component.ts` for "filter flow") is a reliable hit even when its body content isn't semantically/lexically close to the query wording.
 
 - `score` is **not** a raw cosine similarity — it has no fixed range and isn't meaningful on its own; only its relative ordering matters. (The raw cosine range *is* documented, in `vectorIndex.js`'s `search()` doc comment, for anyone working with that module directly.)
-- `confidence` buckets it into something actionable: `"high"` means both the semantic and lexical searches agreed on this result; `"medium"`/`"low"` mean only one did, based on how high it ranked there.
+- `confidence` buckets it into something actionable: `"high"` means at least two of the three signals agreed on this result; `"medium"`/`"low"` mean only one did, based on how high it ranked there.
+- A generic-parsed file (`.scss`/`.html`/`.json`/... — see §9, no real logic granularity) has its score discounted relative to a real code file (`.ts`/`.js`/...) **unless** it earned a genuine lexical hit against its actual body content — otherwise a stylesheet named `theme.scss` could outrank a real `ThemeService` class for a "theme" query purely on filename coincidence (the name-match signal discounts itself at the source too; a config file that genuinely contains what you're searching for, e.g. `appsettings.json` for "database connection string", is never discounted).
 - Tune the fusion via `brain.config.json`'s `rrfK` (see §2) if needed — the default (60) is a standard, untuned choice; RRF's whole appeal is low sensitivity to this constant.
 
 ## 11. Known simplifications (by design, upgradeable later)

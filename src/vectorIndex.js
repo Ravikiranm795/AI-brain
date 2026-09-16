@@ -23,6 +23,7 @@ class VectorIndex {
     this.metaPath = path.join(brainDir, 'vectors.meta.json');
     this.ids = [];
     this.vectors = null; // Float32Array, length = ids.length * EMBEDDING_DIM
+    this._idIndex = null; // lazy id -> position Map, built on first getVector() call, invalidated by any mutation
     this._load();
   }
 
@@ -35,6 +36,7 @@ class VectorIndex {
       this.ids = [];
       this.vectors = new Float32Array(0);
     }
+    this._idIndex = null;
   }
 
   _save() {
@@ -56,12 +58,30 @@ class VectorIndex {
     });
     this.ids = newIds;
     this.vectors = newVectors;
+    this._idIndex = null;
   }
 
   /** Drops every vector - used by a `--force` rebuild, which promises to rebuild from scratch. */
   clear() {
     this.ids = [];
     this.vectors = new Float32Array(0);
+    this._idIndex = null;
+  }
+
+  /**
+   * Direct lookup of one symbol's stored (pre-normalized) vector, or null if
+   * it isn't indexed - used by context.js to score neighbor relevance
+   * against the task query. Backed by a lazily-built id->position Map
+   * rather than ids.indexOf() so repeated per-neighbor lookups (context.js
+   * calls this once per candidate neighbor) don't each pay an O(n) scan.
+   */
+  getVector(symbolId) {
+    if (!this._idIndex) {
+      this._idIndex = new Map(this.ids.map((id, i) => [id, i]));
+    }
+    const i = this._idIndex.get(symbolId);
+    if (i === undefined) return null;
+    return this.vectors.subarray(i * EMBEDDING_DIM, (i + 1) * EMBEDDING_DIM);
   }
 
   addBatch(idVectorPairs) {
@@ -74,6 +94,7 @@ class VectorIndex {
     merged.set(this.vectors, 0);
     merged.set(extra, this.vectors.length);
     this.vectors = merged;
+    this._idIndex = null;
   }
 
   save() {
