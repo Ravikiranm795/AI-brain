@@ -68,6 +68,7 @@ function createServer() {
       const rootDir = resolveRoot(p);
       const { store } = storeCache.get(getRepoBrainDir(rootDir));
       const related = query.expand(rootDir, symbolId, hops || 1, { store });
+      if (!related) return textResult({ error: `No symbol with id ${symbolId}` });
       const annotated = related.map((r) => ({ ...r, alreadyShown: r.symbolId ? session.isSymbolShown(r.symbolId) : false }));
       annotated.forEach((r) => { if (r.symbolId) session.markSymbolShown(r.symbolId); });
       return textResult({ related: annotated });
@@ -93,7 +94,15 @@ function createServer() {
       if (alreadyShown) {
         return textResult({ content: null, alreadyShown: true, relPath, startLine, endLine });
       }
-      const content = query.read(rootDir, relPath, startLine, endLine);
+      let content;
+      try {
+        content = query.read(rootDir, relPath, startLine, endLine);
+      } catch (err) {
+        // Path-traversal / invalid-range rejections from query.read() - see
+        // its guard clauses - surfaced as a clean tool error instead of an
+        // uncaught exception.
+        return textResult({ error: err.message });
+      }
       session.markRangeShown(relPath, startLine, endLine);
       return textResult({ content, alreadyShown: false, relPath, startLine, endLine });
     }
@@ -167,13 +176,20 @@ function createServer() {
       description: 'Build/update the brain for a repo in one incremental pass.',
       inputSchema: {
         path: z.string().optional(),
-        force: z.boolean().optional()
+        force: z.boolean().optional(),
+        precise: z.boolean().optional().describe('Also resolve TS/JS calls via a real language server, if installed (slower, opt-in)'),
+        instructions: z.boolean().optional().describe('Write/update BRAIN-INSTRUCTIONS.md at the repo root (default true)')
       }
     },
-    async ({ path: p, force }) => {
+    async ({ path: p, force, precise, instructions }) => {
       const rootDir = resolveRoot(p);
       const log = [];
-      const result = await buildBrain(rootDir, { force: !!force, onProgress: (msg) => log.push(msg) });
+      const result = await buildBrain(rootDir, {
+        force: !!force,
+        precise: !!precise,
+        instructions: instructions !== false,
+        onProgress: (msg) => log.push(msg)
+      });
       // Must evict: buildBrain opens its own GraphStore/VectorIndex
       // internally, independent of whatever this server has cached - a
       // stale cached VectorIndex would otherwise keep serving pre-build

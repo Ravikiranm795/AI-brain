@@ -31,15 +31,8 @@ CREATE TABLE IF NOT EXISTS edges (
   src_symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
   dst_symbol_id INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
   dst_name TEXT,
-  kind TEXT NOT NULL, -- 'calls' | 'imports'
+  kind TEXT NOT NULL, -- always 'calls' - shared-storage-key coupling is computed on the fly (see getStorageKeyPeers), not stored as an edge row
   resolution TEXT NOT NULL DEFAULT 'heuristic' -- 'heuristic' | 'lsp'
-);
-
-CREATE TABLE IF NOT EXISTS imports (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-  specifier TEXT NOT NULL,
-  imported_names TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -48,11 +41,44 @@ CREATE TABLE IF NOT EXISTS chunks (
   summary TEXT
 );
 
+-- Tracks localStorage/sessionStorage get/set/remove calls with a literal
+-- key, so coupling between files that share a storage key but never
+-- directly call each other (file A writes 'X', file B reads 'X') is
+-- discoverable - see getStorageKeyPeers()/expand()/getCallers() below.
+CREATE TABLE IF NOT EXISTS string_literals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+  file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  key TEXT NOT NULL,
+  store TEXT NOT NULL,
+  action TEXT NOT NULL,
+  line INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_symbol_id);
-CREATE INDEX IF NOT EXISTS idx_imports_file ON imports(file_id);
+CREATE INDEX IF NOT EXISTS idx_string_literals_key ON string_literals(key);
+CREATE INDEX IF NOT EXISTS idx_string_literals_symbol ON string_literals(symbol_id);
+
+-- FTS5 lexical index over full chunk bodies (chunks.code - see parser.js's
+-- nodeBody()), so brain_search can find an identifier/string literal that
+-- only appears inside a function body, not just its first line. Kept in
+-- sync with the chunks table by the triggers below rather than an
+-- external-content setup that needs manual maintenance.
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(code, content='chunks', content_rowid='symbol_id');
+
+CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+  INSERT INTO chunks_fts(rowid, code) VALUES (new.symbol_id, new.code);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+  INSERT INTO chunks_fts(chunks_fts, rowid, code) VALUES('delete', old.symbol_id, old.code);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+  INSERT INTO chunks_fts(chunks_fts, rowid, code) VALUES('delete', old.symbol_id, old.code);
+  INSERT INTO chunks_fts(rowid, code) VALUES (new.symbol_id, new.code);
+END;
 `;
 
 class GraphStore {
@@ -91,13 +117,23 @@ class GraphStore {
     }
 
     addColumnIfMissing('edges', 'resolution', "resolution TEXT NOT NULL DEFAULT 'heuristic'");
+
+    // `CREATE VIRTUAL TABLE IF NOT EXISTS` above creates chunks_fts empty on
+    // a database that already had rows in `chunks` from before FTS existed -
+    // the insert-trigger only fires on new writes, so pre-existing content
+    // needs one explicit rebuild to become searchable.
+    const chunkCount = this.db.prepare('SELECT COUNT(*) AS c FROM chunks').get().c;
+    const ftsCount = this.db.prepare('SELECT COUNT(*) AS c FROM chunks_fts').get().c;
+    if (chunkCount > 0 && ftsCount === 0) {
+      this.db.exec("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')");
+    }
   }
 
   close() {
     this.db.close();
   }
 
-  /** Wipes every row (cascades from files to symbols/edges/imports/chunks) - used by a `--force` rebuild. */
+  /** Wipes every row (cascades from files to symbols/edges/chunks/string_literals) - used by a `--force` rebuild. */
   clearAll() {
     this.db.exec('DELETE FROM files');
   }
@@ -106,7 +142,7 @@ class GraphStore {
     return this.db.prepare('SELECT * FROM files WHERE path = ?').get(relPath);
   }
 
-  /** Fully removes a file and everything that cascades from it (symbols, edges, chunks, imports). */
+  /** Fully removes a file and everything that cascades from it (symbols, edges, chunks, string_literals). */
   deleteFile(relPath) {
     this.db.prepare('DELETE FROM files WHERE path = ?').run(relPath);
   }
@@ -128,8 +164,15 @@ class GraphStore {
         `INSERT INTO symbols (file_id, name, kind, start_line, end_line, start_byte, end_byte, signature)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       );
-      const insertChunk = this.db.prepare('INSERT INTO chunks (symbol_id, code, summary) VALUES (?, ?, ?)');
-      const insertImport = this.db.prepare('INSERT INTO imports (file_id, specifier, imported_names) VALUES (?, ?, ?)');
+      // chunks.code now holds the full (capped) symbol body - see parser.js's
+      // nodeBody() - so it's actually searchable via chunks_fts, not just the
+      // ~160-char signature. chunks.summary is left unpopulated (see
+      // getChunk's note): nothing reads it and it was never more than a
+      // restatement of fields already on `symbols`.
+      const insertChunk = this.db.prepare('INSERT INTO chunks (symbol_id, code) VALUES (?, ?)');
+      const insertLiteral = this.db.prepare(
+        'INSERT INTO string_literals (symbol_id, file_id, key, store, action, line) VALUES (?, ?, ?, ?, ?, ?)'
+      );
 
       const nameToSymbolId = new Map();
 
@@ -145,11 +188,17 @@ class GraphStore {
           sym.signature
         ).lastInsertRowid;
         nameToSymbolId.set(sym.name, symId);
-        insertChunk.run(symId, sym.signature, `${sym.kind} ${sym.name} in ${relPath} (lines ${sym.startLine}-${sym.endLine})`);
+        insertChunk.run(symId, sym.body != null ? sym.body : sym.signature);
       }
 
-      for (const imp of parsed.imports || []) {
-        insertImport.run(fileId, imp.specifier, JSON.stringify(imp.names || []));
+      // Attributed to the enclosing named symbol the same way calls are
+      // (see parser.js's currentScope()) - a literal with no enclosing scope
+      // has nothing to attach the FK to, so it's dropped, same as a call
+      // with no enclosing scope is dropped in insertCallEdges.
+      for (const lit of parsed.literals || []) {
+        const symId = lit.scopeName ? nameToSymbolId.get(lit.scopeName) : null;
+        if (!symId) continue;
+        insertLiteral.run(symId, fileId, lit.key, lit.store, lit.action, lit.line);
       }
 
       return { fileId, nameToSymbolId };
@@ -213,7 +262,57 @@ class GraphStore {
     return this.db.prepare('SELECT * FROM chunks WHERE symbol_id = ?').get(symbolId);
   }
 
-  /** Callers of + callees from a given symbol, `hops` deep. */
+  /**
+   * Lexical/substring match over full symbol bodies via FTS5 (see the
+   * chunks_fts virtual table) - complements vectorIndex's semantic search,
+   * which can miss an exact identifier/string literal that only appears
+   * inside a function body. Each raw query token is quoted so FTS5 treats it
+   * as a literal term (ANDed together) instead of parsing user input as FTS5
+   * query syntax, which would throw on stray `"`/`-`/`*` etc.
+   */
+  searchLexical(queryText, limit = 40) {
+    const terms = (queryText.match(/[A-Za-z0-9_]+/g) || []).slice(0, 16);
+    if (!terms.length) return [];
+    const match = terms.map((t) => `"${t.replace(/"/g, '""')}"`).join(' ');
+    try {
+      // chunks_fts only exposes `rowid` (aliased to chunks.symbol_id via
+      // content_rowid) and its declared columns (`code`) - `symbol_id`
+      // itself is NOT a selectable column on the FTS virtual table, even
+      // though that's the name of the underlying content-table column.
+      return this.db
+        .prepare('SELECT rowid AS symbolId, bm25(chunks_fts) AS score FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY score LIMIT ?')
+        .all(match, limit);
+    } catch (_) {
+      return []; // malformed FTS query (e.g. all-punctuation input) - degrade to semantic-only rather than fail the whole search
+    }
+  }
+
+  /**
+   * Other symbols that read/write/remove the same literal localStorage/
+   * sessionStorage key as `symbolId` (see parser.js's literal capture) -
+   * coupling the call graph can't see at all, since there's no function
+   * call between the writer and the reader.
+   */
+  getStorageKeyPeers(symbolId) {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT sl2.symbol_id AS id, sl1.key AS key
+         FROM string_literals sl1
+         JOIN string_literals sl2 ON sl2.key = sl1.key AND sl2.symbol_id != sl1.symbol_id
+         WHERE sl1.symbol_id = ?`
+      )
+      .all(Number(symbolId));
+    return rows
+      .map((row) => {
+        const sym = this.getSymbolById(row.id);
+        if (!sym) return null;
+        const file = this.getFileById(sym.file_id);
+        return { symbolId: row.id, key: row.key, symbol: sym, file };
+      })
+      .filter(Boolean);
+  }
+
+  /** Callers of + callees from a given symbol, `hops` deep, plus its direct storage-key peers (see getStorageKeyPeers). */
   expand(symbolId, hops = 1) {
     const visited = new Set([symbolId]);
     let frontier = [symbolId];
@@ -241,6 +340,16 @@ class GraphStore {
         }
       }
       frontier = next;
+    }
+
+    // Storage-key coupling is a second, independent edge kind (see
+    // getStorageKeyPeers) - only checked against the root symbol, not
+    // chained through each hop, since "shares a storage key with a peer of
+    // a peer" isn't a meaningful transitive relation the way calls are.
+    for (const peer of this.getStorageKeyPeers(symbolId)) {
+      if (visited.has(peer.symbolId)) continue;
+      visited.add(peer.symbolId);
+      related.push({ symbolId: peer.symbolId, relation: 'shares-storage-key', via: symbolId, sharedKey: peer.key });
     }
 
     return related.map((r) => ({ ...r, symbol: this.getSymbolById(r.symbolId), file: null })).map((r) => {
@@ -284,12 +393,34 @@ class GraphStore {
             path: file ? file.path : null,
             startLine: sym.start_line,
             endLine: sym.end_line,
+            relation: 'caller',
             hops: h
           });
           next.push(row.id);
         }
       }
       frontier = next;
+    }
+
+    // Storage-key peers aren't "callers" in the call-graph sense this
+    // method otherwise guarantees (see the docstring above), but for blast
+    // radius purposes they're exactly the kind of thing that breaks if
+    // `symbolId` changes - a reader of a key that this symbol's writer stops
+    // writing. Reported flat (not hop-chained) alongside true callers.
+    for (const peer of this.getStorageKeyPeers(Number(symbolId))) {
+      if (visited.has(peer.symbolId)) continue;
+      visited.add(peer.symbolId);
+      callers.push({
+        symbolId: peer.symbolId,
+        name: peer.symbol.name,
+        kind: peer.symbol.kind,
+        path: peer.file ? peer.file.path : null,
+        startLine: peer.symbol.start_line,
+        endLine: peer.symbol.end_line,
+        relation: 'shares-storage-key',
+        sharedKey: peer.key,
+        hops: 0
+      });
     }
 
     return callers;

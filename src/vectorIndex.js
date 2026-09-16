@@ -80,6 +80,18 @@ class VectorIndex {
     this._save();
   }
 
+  /**
+   * Returns { symbolId, score }[], `score` a raw cosine similarity in
+   * [-1, 1] (1 = identical direction, 0 = orthogonal/unrelated, negative =
+   * opposing) since embeddings are pre-normalized before storage - see
+   * embedder.js's embedText(). In practice all-MiniLM-L6-v2 embeddings of
+   * real code/text rarely go negative; most unrelated-pair scores land
+   * around 0.1-0.3, same-topic pairs around 0.5-0.7+. query.js's search()
+   * does not return this raw score directly - it feeds this ranking into a
+   * reciprocal-rank fusion with FTS5 lexical search results, so the `score`
+   * an agent actually sees is an RRF score, not this cosine value; see
+   * query.js's DEFAULT_RRF_K comment and README §10.
+   */
   search(queryVec, k = 10) {
     const n = this.ids.length;
     const scores = new Array(n);

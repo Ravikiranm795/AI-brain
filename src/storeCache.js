@@ -2,8 +2,10 @@
 
 const { GraphStore } = require('./graphStore');
 const { VectorIndex } = require('./vectorIndex');
+const { getBrainsHome } = require('./config');
+const { loadUserConfig } = require('./userConfig');
 
-const MAX_OPEN = 5;
+const DEFAULT_MAX_OPEN = 5;
 
 /**
  * Keeps GraphStore/VectorIndex pairs open across many MCP tool calls for the
@@ -14,6 +16,12 @@ const MAX_OPEN = 5;
 class StoreCache {
   constructor() {
     this.entries = new Map(); // brainDir -> { store, vectorIndex, lastUsed }
+    // StoreCache spans every repo this process touches, not one repo, so
+    // its override can only come from the machine-wide BRAIN_HOME-level
+    // brain.config.json, not a repo-level one (there's no single rootDir
+    // here) - see userConfig.js.
+    const userCfg = loadUserConfig(null, getBrainsHome());
+    this.maxOpen = userCfg.maxOpen || DEFAULT_MAX_OPEN;
   }
 
   get(brainDir) {
@@ -43,7 +51,7 @@ class StoreCache {
   }
 
   _evictLeastRecentlyUsedIfOverCap() {
-    if (this.entries.size <= MAX_OPEN) return;
+    if (this.entries.size <= this.maxOpen) return;
     let oldestKey = null;
     let oldestTime = Infinity;
     for (const [key, entry] of this.entries) {

@@ -2,7 +2,8 @@
 
 const { GraphStore } = require('./graphStore');
 const { VectorIndex } = require('./vectorIndex');
-const { getRepoBrainDir } = require('./config');
+const { getRepoBrainDir, getBrainsHome } = require('./config');
+const { loadUserConfig } = require('./userConfig');
 const query = require('./query');
 
 const DEFAULT_K = 8;
@@ -21,10 +22,14 @@ const MAX_ITEMS = 60;
  * parser.js's nodeSig()/parseGenericFile) and are not full code bodies.
  */
 async function buildContext(rootDir, taskText, opts = {}, deps = {}) {
+  const userCfg = loadUserConfig(rootDir, getBrainsHome());
+  const defaultBudgetChars = userCfg.defaultBudgetChars || DEFAULT_BUDGET_CHARS;
+  const maxItems = userCfg.maxItems || MAX_ITEMS;
+
   const {
     k = DEFAULT_K,
     hops = DEFAULT_HOPS,
-    budgetChars = DEFAULT_BUDGET_CHARS,
+    budgetChars = defaultBudgetChars,
     kind,
     ext
   } = opts;
@@ -79,7 +84,7 @@ async function buildContext(rootDir, taskText, opts = {}, deps = {}) {
       ...primaryHits.map((h) => ({ ...h, tier: 'primary' })),
       ...prioritizedHop1.map((n) => ({ ...n, tier: 'hop1' })),
       ...hop2plus.map((n) => ({ ...n, tier: 'hop2plus' }))
-    ].slice(0, MAX_ITEMS);
+    ].slice(0, maxItems);
 
     const notes = [];
     const totalCandidates =
@@ -88,6 +93,11 @@ async function buildContext(rootDir, taskText, opts = {}, deps = {}) {
       notes.push(`${totalCandidates - priorityOrder.length} lower-priority neighbors omitted (item cap reached)`);
     }
 
+    // usedChars tracks a running estimate (per-item JSON size) so the code-
+    // inclusion decisions below can be made cheaply without re-serializing
+    // the whole response on every item; the authoritative number reported to
+    // the caller is computed once at the end from the actual assembled
+    // response (see approxResponseChars below), not this running estimate.
     let usedChars = 0;
     let truncated = false;
     const primary = [];
@@ -101,9 +111,13 @@ async function buildContext(rootDir, taskText, opts = {}, deps = {}) {
       let code = null;
       if (wantsCode && item.path && usedChars < budgetChars) {
         const text = query.read(rootDir, item.path, item.startLine, item.endLine);
-        if (usedChars + text.length <= budgetChars) {
+        // JSON.stringify(text).length, not text.length, so escaping/quoting
+        // overhead counts toward the budget the same way it will once this
+        // is actually serialized.
+        const cost = JSON.stringify(text).length;
+        if (usedChars + cost <= budgetChars) {
           code = text;
-          usedChars += text.length;
+          usedChars += cost;
         } else {
           truncated = true;
         }
@@ -111,6 +125,10 @@ async function buildContext(rootDir, taskText, opts = {}, deps = {}) {
         truncated = true;
       }
 
+      // Once we're over budget on code, neighbor-tier metadata is trimmed
+      // next (dropping the ~160-char signature) rather than dropping the
+      // item outright - cheaper than code, but not free at MAX_ITEMS scale.
+      const dropSignature = truncated && item.tier !== 'primary';
       const base = {
         symbolId: item.symbolId,
         name: item.name,
@@ -118,7 +136,7 @@ async function buildContext(rootDir, taskText, opts = {}, deps = {}) {
         path: item.path,
         startLine: item.startLine,
         endLine: item.endLine,
-        signature: item.signature,
+        signature: dropSignature ? null : item.signature,
         code
       };
 
@@ -129,14 +147,22 @@ async function buildContext(rootDir, taskText, opts = {}, deps = {}) {
       }
     }
 
-    return {
+    const response = {
       task: taskText,
-      budget: { limitChars: budgetChars, usedChars, truncated },
+      budget: { limitChars: budgetChars, usedChars: 0, truncated },
       primary,
       neighbors,
       filesTouched: [...filesTouched],
       notes
     };
+
+    // Ground-truth size: the actual pretty-printed JSON this bundle turns
+    // into (matching mcpServer.js's textResult()/the CLI's JSON.stringify),
+    // not just the sum of included code text - metadata, hop2plus
+    // neighbors, and pretty-print overhead all count now.
+    response.budget.usedChars = JSON.stringify(response, null, 2).length;
+
+    return response;
   } finally {
     if (shouldClose) store.close();
   }

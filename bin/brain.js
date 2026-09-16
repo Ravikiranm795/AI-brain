@@ -27,6 +27,7 @@ program
   .option('-p, --path <dir>', 'repo root', '.')
   .option('-f, --force', 'ignore existing manifest and rebuild everything from scratch', false)
   .option('--precise', 'also resolve TS/JS calls via a real language server, if installed (slower, opt-in)', false)
+  .option('--no-instructions', 'skip writing/updating BRAIN-INSTRUCTIONS.md at the repo root')
   .action(async (opts) => {
     const root = path.resolve(opts.path);
     if (!fs.existsSync(root)) {
@@ -38,12 +39,13 @@ program
     const result = await buildBrain(root, {
       force: opts.force,
       precise: opts.precise,
+      instructions: opts.instructions,
       onProgress: (msg) => console.log(msg)
     });
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
     console.log(`\nBrain ready in ${secs}s -> ${result.brainDir}`);
     console.log(`Symbols: ${result.stats.symbols}  Vectors: ${result.stats.vectors}`);
-    console.log(`Wrote BRAIN-INSTRUCTIONS.md at repo root - point your agent at it.`);
+    if (opts.instructions) console.log(`Wrote BRAIN-INSTRUCTIONS.md at repo root - point your agent at it.`);
   });
 
 program
@@ -68,6 +70,10 @@ program
   .option('--hops <n>', 'hop count', '1')
   .action((symbolId, opts) => {
     const results = query.expand(path.resolve(opts.path), symbolId, Number(opts.hops));
+    if (!results) {
+      console.error(`No symbol with id ${symbolId}`);
+      process.exit(1);
+    }
     console.log(JSON.stringify(results, null, 2));
   });
 
@@ -114,8 +120,13 @@ program
   .description('Read an exact line range from a file - no full-file or directory scan')
   .option('-p, --path <dir>', 'repo root', '.')
   .action((relPath, startLine, endLine, opts) => {
-    const content = query.read(path.resolve(opts.path), relPath, startLine, endLine);
-    console.log(content);
+    try {
+      const content = query.read(path.resolve(opts.path), relPath, startLine, endLine);
+      console.log(content);
+    } catch (err) {
+      console.error(err.message);
+      process.exit(1);
+    }
   });
 
 program

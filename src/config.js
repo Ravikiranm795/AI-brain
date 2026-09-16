@@ -3,6 +3,27 @@
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
+const { loadUserConfig } = require('./userConfig');
+
+// Directories this process has already confirmed exist (and created if
+// needed) - getBrainsHome()/getRepoBrainDir() are called on every single MCP
+// tool handler's hot path (see mcpServer.js), so without this an idle
+// long-lived server process re-stats (and, on the happy path, still
+// re-stats even when nothing's wrong) the same couple of directories on
+// every tool call for its whole lifetime. A directory removed out from
+// under a running process is not a case this cache needs to handle - that's
+// already true of the store/vector-index handles StoreCache keeps open.
+const verifiedDirs = new Set();
+
+function ensureDirExists(dir) {
+  if (verifiedDirs.has(dir)) return dir;
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  verifiedDirs.add(dir);
+  return dir;
+}
 
 /**
  * Central store for ALL repo brains lives here.
@@ -11,31 +32,28 @@ const fs = require('fs');
  */
 function getBrainsHome() {
   const home = process.env.BRAIN_HOME || path.join(os.homedir(), '.brains');
-  if (!fs.existsSync(home)) {
-    fs.mkdirSync(home, { recursive: true });
-  }
-  return home;
+  return ensureDirExists(home);
 }
 
 /**
- * Every repo's id is just its folder name, so the brain directory reads
- * cleanly (e.g. `<BRAIN_HOME>/my-repo`) and re-running `brain build` from
- * that same repo always updates the same folder in place. If two different
- * repos share a basename, the second one's build reuses/overwrites the
- * first's brain folder - by design, kept simple.
+ * `<basename>-<hash of the resolved absolute path>`, matching the layout
+ * documented in README §8 - the basename keeps the brain directory
+ * human-readable (e.g. `<BRAIN_HOME>/my-repo-a1b2c3d4`), and the hash
+ * suffix is what actually makes the id unique. Without it, two different
+ * repos that happen to share a folder name (e.g. two separate checkouts
+ * both named `frontend`) would silently collide on one brain folder - the
+ * second repo's `brain build` would overwrite the first's index.
  */
 function getRepoId(rootDir) {
   const abs = path.resolve(rootDir);
-  const base = path.basename(abs).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-  return base || 'repo';
+  const base = path.basename(abs).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'repo';
+  const hash = crypto.createHash('sha1').update(abs).digest('hex').slice(0, 8);
+  return `${base}-${hash}`;
 }
 
 function getRepoBrainDir(rootDir) {
   const dir = path.join(getBrainsHome(), getRepoId(rootDir));
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-  return dir;
+  return ensureDirExists(dir);
 }
 
 function listAllRepoBrains() {
@@ -107,6 +125,15 @@ function isTestFile(relPath) {
   return TEST_FILE_PATTERNS.some((re) => re.test(relPath));
 }
 
+// Files above this size are skipped by the walker regardless of extension -
+// a single-file override isn't worth the config surface; a legitimate source
+// file this large is itself a smell. See walker.js's walk().
+const MAX_FILE_SIZE_BYTES = 300 * 1024;
+
+// Early-warning margin below vectorIndex.js's documented ~200k-symbol
+// brute-force-search ceiling (see its class doc comment).
+const VECTOR_INDEX_WARN_THRESHOLD = 150000;
+
 const DEFAULT_IGNORE_DIRS = [
   'node_modules',
   '.git',
@@ -122,6 +149,24 @@ const DEFAULT_IGNORE_DIRS = [
   'vendor'
 ];
 
+/**
+ * DEFAULT_IGNORE_DIRS plus any repo/BRAIN_HOME-level `ignoreDirs` from
+ * brain.config.json (see userConfig.js) - additive, not a replacement, so a
+ * misconfigured override can't accidentally un-ignore node_modules/.git.
+ */
+function getEffectiveIgnoreDirs(rootDir) {
+  const user = loadUserConfig(rootDir, getBrainsHome());
+  const extra = Array.isArray(user.ignoreDirs) ? user.ignoreDirs : [];
+  return extra.length ? [...new Set([...DEFAULT_IGNORE_DIRS, ...extra])] : DEFAULT_IGNORE_DIRS;
+}
+
+/** SUPPORTED_EXTENSIONS plus any repo/BRAIN_HOME-level `extraExtensions`. */
+function getEffectiveSupportedExtensions(rootDir) {
+  const user = loadUserConfig(rootDir, getBrainsHome());
+  const extra = Array.isArray(user.extraExtensions) ? user.extraExtensions : [];
+  return extra.length ? new Set([...SUPPORTED_EXTENSIONS, ...extra]) : SUPPORTED_EXTENSIONS;
+}
+
 module.exports = {
   getBrainsHome,
   getRepoId,
@@ -130,5 +175,9 @@ module.exports = {
   SUPPORTED_EXTENSIONS,
   FULLY_PARSED_EXTENSIONS,
   DEFAULT_IGNORE_DIRS,
+  MAX_FILE_SIZE_BYTES,
+  VECTOR_INDEX_WARN_THRESHOLD,
+  getEffectiveIgnoreDirs,
+  getEffectiveSupportedExtensions,
   isTestFile
 };

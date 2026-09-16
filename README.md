@@ -8,6 +8,7 @@ higher-level tools (one-shot context assembly, pre-edit safety checks, a
 live MCP server) on top of the raw graph, not just search.
 
 - **One command** does the whole pipeline: walk → parse → graph → embed → vector index.
+- **Hybrid search**: `brain search` fuses semantic (embedding) search with a lexical FTS5 index over full symbol bodies, so an exact identifier or string literal buried inside a function still surfaces — see §10.
 - **Incremental**: re-running only touches files that actually changed (hash-diff), so repeat builds on an already-indexed repo are near-instant. `--force` truly rebuilds from scratch.
 - **Multi-repo**: every repo gets its own isolated brain folder in one central store — nothing leaks between projects.
 - **Multi-agent**: it's a plain CLI, so Claude Code, Amazon Q, or anything else that can run a shell command can use it the same way — and it's also a live **MCP server** for agents that speak MCP natively.
@@ -74,12 +75,12 @@ brain build
 ```
 
 This does everything in one pass:
-1. Walks the project once (respects `.gitignore`, skips `node_modules`, `.git`, `dist`, `build`, etc.)
+1. Walks the project once (respects `.gitignore`, skips `node_modules`, `.git`, `dist`, `build`, etc., and — see §9a — minified bundles and any single file over 300KB)
 2. Hashes every file and diffs against the last build (first run = everything is "added")
-3. Parses changed/new files with tree-sitter → extracts functions, classes, imports, call edges (full parsing for JS/TS/Java/Python; a whole-file fallback for everything else supported — see §9)
-4. Builds/updates the SQLite dependency graph, including which files are tests and which calls happen inside a test/suite/hook
-5. Generates local embeddings for new/changed symbols and updates the vector index
-6. Writes `BRAIN-INSTRUCTIONS.md` into the repo root — this is what tells Claude Code / Amazon Q not to rescan the project and to use the brain commands instead
+3. Parses changed/new files with tree-sitter → extracts functions, classes, imports, call edges, and localStorage/sessionStorage key usage (full parsing for JS/TS/Java/Python/C#/PHP; a whole-file fallback for everything else supported — see §9)
+4. Builds/updates the SQLite dependency graph and lexical (FTS5) index, including which files are tests and which calls happen inside a test/suite/hook
+5. Generates local embeddings for new/changed symbols (batched per file) and updates the vector index
+6. Writes `BRAIN-INSTRUCTIONS.md` into the repo root — this is what tells Claude Code / Amazon Q not to rescan the project and to use the brain commands instead (skip with `--no-instructions`)
 
 Run it again anytime after making changes — unchanged files are skipped automatically, so it's fast:
 
@@ -122,6 +123,23 @@ brain check 42
 ```
 
 All commands accept `--path <repo-dir>` if you're not running from inside the repo.
+
+### Overriding defaults with `brain.config.json`
+
+Drop a `brain.config.json` at a repo's root (repo-specific) and/or at `BRAIN_HOME` (machine-wide) to override built-in defaults without touching code — repo-level wins when both exist:
+
+```json
+{
+  "ignoreDirs": ["generated"],
+  "extraExtensions": [".mts"],
+  "defaultBudgetChars": 40000,
+  "maxItems": 100,
+  "maxOpen": 10,
+  "rrfK": 60
+}
+```
+
+All keys are optional. `ignoreDirs`/`extraExtensions` are *added* to the built-in lists (not a replacement), so a typo can't accidentally un-ignore `node_modules`. `maxOpen` (StoreCache's LRU cap on open repos) only makes sense machine-wide, so it's only read from `BRAIN_HOME`'s config, not a repo-level one. See `src/userConfig.js` for the full list.
 
 ### Multi-repo
 
@@ -179,7 +197,7 @@ Reports, for symbol `42`:
 }
 ```
 
-- **`blastRadius`**: every symbol that transitively calls this one, up to `--hops` deep — "what breaks if I change this."
+- **`blastRadius`**: every symbol that transitively calls this one, up to `--hops` deep — "what breaks if I change this." Also includes (flat, not hop-chained) any symbol that reads/writes the same `localStorage`/`sessionStorage` key, tagged `relation: "shares-storage-key"` with a `sharedKey` field — coupling the call graph alone can't see, since there's no function call between the writer and the reader.
 - **`testsCovering`**: which tests (Jest/Mocha-style `it`/`test`/`describe` blocks in JS/TS, `def test_*` functions in Python, `@Test` methods in Java, all detected automatically during `brain build`) actually exercise this symbol.
 - **`risk`**: `"covered"` if any test does, `"untested"` otherwise.
 
@@ -264,7 +282,7 @@ indexed (not just the current one), with:
 
 ## 7. `brain build --precise` — real go-to-definition resolution (TS/JS)
 
-By default, call-graph edges are resolved **by name**: a call to `validate()` links to every symbol named `validate` anywhere in the repo, which can over-match when multiple files define same-named functions (see §10). `--precise` layers a second pass on top that asks a real language server for the actual definition at each call site, for TypeScript/JavaScript specifically:
+By default, call-graph edges are resolved **by name**: a call to `validate()` links to every symbol named `validate` anywhere in the repo, which can over-match when multiple files define same-named functions (see §11). `--precise` layers a second pass on top that asks a real language server for the actual definition at each call site, for TypeScript/JavaScript specifically:
 
 ```bash
 npm i -g typescript-language-server typescript   # one-time, separate from this tool
@@ -275,6 +293,7 @@ brain build --precise
 - **Graceful by design**: if `typescript-language-server` isn't installed, isn't found, or doesn't respond, `brain build` logs one warning line and continues with the heuristic result — it will never hang or abort the build over this.
 - **Known limitation**: it uses one project root (your repo root) for the whole build. In a monorepo where the actual TypeScript project lives in a subfolder (e.g. `frontend/` with its own `node_modules/typescript`), the language server may not find a valid TypeScript install and this pass will fall back for the whole build. Per-subdirectory project detection isn't implemented in v1.
 - Only TypeScript/JavaScript are wired up today; the registry in `src/lsp/servers.js` is designed so adding another language (e.g. `pyright` for Python) later is a config entry, not an architecture change.
+- Available from the MCP server too: `brain_build`'s `precise` argument does the same thing as the CLI's `--precise` flag.
 
 ---
 
@@ -282,12 +301,15 @@ brain build --precise
 
 ```
 <BRAIN_HOME>/
-  <repo-slug>-<hash>/        # one folder per repo, fully isolated
-    manifest.json             # file hashes, used for incremental diffing
-    graph.sqlite               # files, symbols, edges, imports, chunks tables
-    vectors.bin                 # flat Float32Array of symbol embeddings
-    vectors.meta.json            # symbol ids matching vectors.bin order
+  brain.config.json           # optional, machine-wide overrides - see §2
+  <repo-slug>-<hash>/          # one folder per repo, fully isolated
+    manifest.json               # file hashes + content-format version, used for incremental diffing
+    graph.sqlite                 # files, symbols, edges, string_literals, chunks tables + chunks_fts (FTS5 lexical index)
+    vectors.bin                   # flat Float32Array of symbol embeddings
+    vectors.meta.json              # symbol ids matching vectors.bin order
 ```
+
+A repo can also have its own `brain.config.json` at its root (repo-specific overrides — see §2).
 
 Nothing is ever written back into your source repo except the one
 `BRAIN-INSTRUCTIONS.md` file — the actual index lives entirely outside the
@@ -307,14 +329,27 @@ See `FULLY_PARSED_EXTENSIONS`/`GENERICALLY_PARSED_EXTENSIONS` in `src/config.js`
 
 Adding full parsing for another language means adding its tree-sitter grammar package and a case in `src/parser.js`'s language/visitor setup — most languages need very little new code, since call/import node-type patterns tend to be shared across C-family and dynamic languages (e.g. C# and PHP's class/method declarations reuse the exact same visitor cases already written for Java).
 
-## 10. Known simplifications (by design, upgradeable later)
+### 9a. Files excluded from the index
+
+Beyond `.gitignore` and `DEFAULT_IGNORE_DIRS` (`node_modules`, `.git`, `dist`, `build`, ...): any `*.min.js`/`*.min.css` file, and any single file over 300KB (`MAX_FILE_SIZE_BYTES` in `src/config.js`) — both are cheap-to-hit cases (a vendored bundle checked in outside `dist/`, a generated file) that are expensive to parse/embed and have no meaningful symbol boundaries anyway. Extend the size/ignore-dir list via `brain.config.json` (see §2).
+
+## 10. `brain search` result scoring
+
+Each result's `score` is a [reciprocal-rank-fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf) score combining two independent rankings: `vectorIndex.js`'s semantic (embedding cosine) search, and a lexical/substring search over full symbol bodies via SQLite FTS5 (`chunks_fts` in `graph.sqlite`) — so an exact identifier or string literal that only appears inside a function body (not just its first line) still surfaces, even with zero semantic similarity to the query text.
+
+- `score` is **not** a raw cosine similarity — it has no fixed range and isn't meaningful on its own; only its relative ordering matters. (The raw cosine range *is* documented, in `vectorIndex.js`'s `search()` doc comment, for anyone working with that module directly.)
+- `confidence` buckets it into something actionable: `"high"` means both the semantic and lexical searches agreed on this result; `"medium"`/`"low"` mean only one did, based on how high it ranked there.
+- Tune the fusion via `brain.config.json`'s `rrfK` (see §2) if needed — the default (60) is a standard, untuned choice; RRF's whole appeal is low sensitivity to this constant.
+
+## 11. Known simplifications (by design, upgradeable later)
 
 - **Default call-edge resolution is name-based**, not full scope/type resolution — if two files each have a function called `validate`, a call to `validate()` may link to both. Good enough for "what calls this / what does this call" style navigation; `--precise` (§7) layers real resolution on top for TS/JS when a language server is available.
-- **Vector search is a flat, brute-force cosine index** (pure JS, no native ANN library) — chosen for zero install risk across OSes at the scale this targets (tens of thousands of symbols per repo). If a single repo grows past ~200k symbols, swap `src/vectorIndex.js` for a proper HNSW library (e.g. `usearch`) without touching anything else.
+- **Vector search is a flat, brute-force cosine index** (pure JS, no native ANN library) — chosen for zero install risk across OSes at the scale this targets (tens of thousands of symbols per repo). `brain build` logs a warning once a repo's vector index passes 150k symbols, ahead of the ~200k design ceiling. If a single repo grows past that, swap `src/vectorIndex.js` for a proper HNSW library (e.g. `usearch`) without touching anything else.
+- **`brain search`'s lexical half only covers full-parsed languages' function/method bodies** (JS/TS/Java/Python/C#/PHP - see §9) plus whatever fits in a whole-file fallback chunk (capped at 20,000 characters per symbol, `MAX_CHUNK_CHARS` in `src/parser.js`) — a match past that cap in a single pathologically large function/file won't be found lexically (semantic search over the signature still applies).
 - **Test-coverage detection is call-graph-based, not execution-based** — `brain check`'s `testsCovering` means "a test transitively calls this," not "this line was hit by a passing test run." A test that exists but is skipped, or that calls the symbol without meaningfully asserting on it, still counts as "covered."
 - **`--precise` resolves one project root per repo** — see the monorepo limitation in §7.
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 - **`npm install` fails on `better-sqlite3` or `tree-sitter`** — these compile a small native addon. Make sure you have a C++ build toolchain: on Windows, `npm install -g windows-build-tools` (or install "Desktop development with C++" via Visual Studio Build Tools); on Mac, run `xcode-select --install`.
 - **First `brain build` seems slow / needs internet** — that's the one-time ~90MB embedding model download. Subsequent runs are fully offline.

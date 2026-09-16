@@ -3,6 +3,15 @@
 const fs = require('fs');
 const path = require('path');
 
+// Bump whenever a change alters what gets stored per-symbol independent of
+// the source file's own hash (e.g. chunks.code switching from a truncated
+// signature to the full body - see parser.js's nodeBody()/graphStore.js's
+// upsertFile). buildBrain.js compares this against the manifest's own
+// contentVersion and forces one full rebuild when they differ, so existing
+// indexed repos pick up the new content shape on their next `brain build`
+// without the user needing to know about `--force`.
+const CONTENT_VERSION = 2;
+
 function manifestPath(brainDir) {
   return path.join(brainDir, 'manifest.json');
 }
@@ -48,4 +57,4 @@ function diffAgainstManifest(manifest, currentFiles) {
   return { changed, added, unchanged, deleted };
 }
 
-module.exports = { readManifest, writeManifest, diffAgainstManifest };
+module.exports = { readManifest, writeManifest, diffAgainstManifest, CONTENT_VERSION };

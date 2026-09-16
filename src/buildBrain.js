@@ -6,13 +6,13 @@ const { walkProject } = require('./walker');
 const { hashFile } = require('./hasher');
 const { parseFile } = require('./parser');
 const { GraphStore } = require('./graphStore');
-const { embedText } = require('./embedder');
+const { embedBatch } = require('./embedder');
 const { VectorIndex } = require('./vectorIndex');
-const { readManifest, writeManifest, diffAgainstManifest } = require('./manifest');
-const { getRepoBrainDir, getRepoId } = require('./config');
+const { readManifest, writeManifest, diffAgainstManifest, CONTENT_VERSION } = require('./manifest');
+const { getRepoBrainDir, getRepoId, VECTOR_INDEX_WARN_THRESHOLD } = require('./config');
 const { writeInstructions } = require('./instructions');
 
-async function buildBrain(rootDir, { onProgress = () => {}, force = false, precise = false } = {}) {
+async function buildBrain(rootDir, { onProgress = () => {}, force = false, precise = false, instructions = true } = {}) {
   const root = path.resolve(rootDir);
   const brainDir = getRepoBrainDir(root);
   const repoId = getRepoId(root);
@@ -25,7 +25,17 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
   onProgress(`Found ${walked.length} source files`);
 
   // 2. Hash every file, diff against the last manifest
-  const manifest = force ? { version: 1, rootDir: root, builtAt: null, files: {} } : readManifest(brainDir);
+  const priorManifest = force ? null : readManifest(brainDir);
+  // A content-shape change (e.g. chunks.code now storing full bodies - see
+  // manifest.js's CONTENT_VERSION) invalidates every file's cached
+  // symbols/embeddings even though the file itself hasn't changed, so treat
+  // it exactly like --force for this one build.
+  const contentUpgrade = !force && !!priorManifest && priorManifest.contentVersion !== CONTENT_VERSION;
+  if (contentUpgrade) {
+    onProgress('Brain content format upgraded - forcing one full rebuild to pick up the new format.');
+  }
+  force = force || contentUpgrade;
+  const manifest = force ? { version: 1, rootDir: root, builtAt: null, files: {} } : priorManifest;
   const hashed = [];
   for (const f of walked) {
     const hash = await hashFile(f.absPath);
@@ -86,14 +96,12 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
       const { fileId } = store.upsertFile(f.relPath, f.hash, f.mtime, f.ext, parsed);
       pendingCallEdges.push({ fileId, relPath: f.relPath, ext: f.ext, source, calls: parsed.calls });
 
-      // Embed each new symbol's chunk summary
+      // Embed this file's new symbols in one batched forward pass instead
+      // of one await per symbol - see embedder.js's embedBatch().
       const symbolRows = store.db.prepare('SELECT id, name, kind, signature FROM symbols WHERE file_id = ?').all(fileId);
-      const pairs = [];
-      for (const sym of symbolRows) {
-        const text = `${sym.kind} ${sym.name}: ${sym.signature}`;
-        const vec = await embedText(text);
-        pairs.push([sym.id, vec]);
-      }
+      const texts = symbolRows.map((sym) => `${sym.kind} ${sym.name}: ${sym.signature}`);
+      const vecs = await embedBatch(texts);
+      const pairs = symbolRows.map((sym, i) => [sym.id, vecs[i]]);
       if (pairs.length) vectorIndex.addBatch(pairs);
 
       manifest.files[f.relPath] = { hash: f.hash, mtime: f.mtime };
@@ -128,12 +136,23 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
     manifest.rootDir = root;
     manifest.builtAt = new Date().toISOString();
     manifest.repoId = repoId;
+    manifest.contentVersion = CONTENT_VERSION;
     writeManifest(brainDir, manifest);
 
-    writeInstructions(root, brainDir, repoId);
+    if (instructions) writeInstructions(root, brainDir, repoId);
 
     const totalSymbols = store.countSymbols();
     onProgress(`Done. ${totalSymbols} symbols indexed. Vector index size: ${vectorIndex.size}`);
+    // vectorIndex.js documents a ~200k-symbol design ceiling for its
+    // brute-force cosine search (no ANN structure) - warn well before that,
+    // so a growing repo gets a heads-up instead of a silent slowdown.
+    if (vectorIndex.size > VECTOR_INDEX_WARN_THRESHOLD) {
+      onProgress(
+        `WARNING: vector index has ${vectorIndex.size} symbols, past the ${VECTOR_INDEX_WARN_THRESHOLD}-symbol early-warning ` +
+        `threshold for the brute-force cosine search (~200k documented ceiling - see vectorIndex.js). Search will keep working ` +
+        `but may start to noticeably slow down as this grows.`
+      );
+    }
 
     return {
       repoId,

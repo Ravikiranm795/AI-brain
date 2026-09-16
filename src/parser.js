@@ -11,6 +11,12 @@ const Python = require('tree-sitter-python');
 const CSharp = require('tree-sitter-c-sharp');
 const Php = require('tree-sitter-php').php;
 
+// Per-symbol cap on the full body text stored in chunks.code (see
+// pushSymbol's nodeBody()) - bounds pathological cases (a single
+// minified-but-not-.min-named file, a generated 10k-line class) without
+// meaningfully truncating the vast majority of real functions/methods.
+const MAX_CHUNK_CHARS = 20000;
+
 // Extensions with a real tree-sitter grammar wired into the visitor below.
 // Anything else falls back to parseGenericFile (whole-file chunk, no
 // fine-grained symbols) - see SUPPORTED_EXTENSIONS/GENERICALLY_PARSED_EXTENSIONS
@@ -53,12 +59,21 @@ function parseFile(absPath, ext, source) {
   try {
     tree = parser.parse(code);
   } catch (err) {
-    return { symbols: [], imports: [], calls: [], error: `parse-failed: ${err.message}` };
+    return { symbols: [], imports: [], calls: [], literals: [], error: `parse-failed: ${err.message}` };
   }
 
   const symbols = [];
   const imports = [];
   const calls = [];
+  const literals = [];
+
+  // localStorage/sessionStorage get/set/remove calls with a literal key -
+  // the coupling this captures (file A writes a key, file B reads it, with
+  // no function call between them) is invisible to the call graph, so it's
+  // tracked separately and joined in graphStore.expand()/getCallers() as a
+  // second edge kind. See STORAGE_METHODS below for the exact shape matched.
+  const STORAGE_OBJECTS = new Set(['localStorage', 'sessionStorage']);
+  const STORAGE_METHOD_ACTIONS = { getItem: 'read', setItem: 'write', removeItem: 'remove' };
 
   // Track the innermost named function/method we're currently inside, so
   // call expressions can be attributed to their enclosing symbol.
@@ -71,6 +86,14 @@ function parseFile(absPath, ext, source) {
     return text.split('\n')[0].trim();
   }
 
+  // Full body text for this symbol, capped - this (not the ~160-char
+  // signature) is what goes into chunks.code and gets FTS5-indexed, so
+  // brain_search can match identifiers/literals that only appear inside a
+  // function body, not just its first line.
+  function nodeBody(node) {
+    return code.slice(node.startIndex, node.endIndex).slice(0, MAX_CHUNK_CHARS);
+  }
+
   function pushSymbol(node, name, kind) {
     const sym = {
       name,
@@ -79,7 +102,8 @@ function parseFile(absPath, ext, source) {
       endLine: node.endPosition.row + 1,
       startByte: node.startIndex,
       endByte: node.endIndex,
-      signature: nodeSig(node, name)
+      signature: nodeSig(node, name),
+      body: nodeBody(node)
     };
     symbols.push(sym);
     return sym;
@@ -385,6 +409,20 @@ function parseFile(absPath, ext, source) {
           }
         }
 
+        if (calleeObjectName && STORAGE_OBJECTS.has(calleeObjectName) && STORAGE_METHOD_ACTIONS[calleeName]) {
+          const argsNode = node.childForFieldName('arguments');
+          const firstArg = argsNode && argsNode.namedChildren[0];
+          if (firstArg && (firstArg.type === 'string' || firstArg.type === 'template_string')) {
+            literals.push({
+              key: firstArg.text.replace(/^['"`]|['"`]$/g, ''),
+              store: calleeObjectName,
+              action: STORAGE_METHOD_ACTIONS[calleeName],
+              scopeName: currentScope() ? currentScope().name : null,
+              line: node.startPosition.row + 1
+            });
+          }
+        }
+
         // Calls made inside an anonymous callback that's never assigned to a
         // named variable (e.g. `it('does x', () => {...})`) are normally
         // dropped below since there's no enclosing named scope to attribute
@@ -437,7 +475,7 @@ function parseFile(absPath, ext, source) {
 
   visit(tree.rootNode);
 
-  return { symbols, imports, calls };
+  return { symbols, imports, calls, literals };
 }
 
 /**
@@ -460,12 +498,14 @@ function parseGenericFile(absPath, code) {
         endLine: lines.length,
         startByte: 0,
         endByte: code.length,
-        signature: firstLine.slice(0, 160)
+        signature: firstLine.slice(0, 160),
+        body: code.slice(0, MAX_CHUNK_CHARS)
       }
     ],
     imports: [],
-    calls: []
+    calls: [],
+    literals: []
   };
 }
 
-module.exports = { parseFile };
+module.exports = { parseFile, MAX_CHUNK_CHARS };
