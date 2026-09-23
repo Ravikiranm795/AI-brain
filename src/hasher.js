@@ -27,4 +27,20 @@ async function hashFile(absPath) {
   return h64Raw(content).toString(16).padStart(16, '0');
 }
 
-module.exports = { hashFile };
+/**
+ * Same hash, for a caller that has already read the bytes - lets a forced
+ * build hash and parse from one read instead of reading the whole repo
+ * twice (see buildBrain.js). Synchronous, so it requires the wasm module to
+ * already be resolved; warmHasher() below is how a caller guarantees that.
+ */
+let syncHasher = null;
+function hashBuffer(buf) {
+  if (!syncHasher) throw new Error('hashBuffer() called before warmHasher() - the xxhash wasm module has to be loaded first');
+  return syncHasher.h64Raw(buf).toString(16).padStart(16, '0');
+}
+
+async function warmHasher() {
+  syncHasher = await getHasher();
+}
+
+module.exports = { hashFile, hashBuffer, warmHasher };

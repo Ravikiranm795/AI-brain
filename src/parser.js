@@ -57,9 +57,25 @@ function parseFile(absPath, ext, source) {
 
   let tree;
   try {
-    tree = parser.parse(code);
+    // The explicit `bufferSize` is NOT optional tuning - without it,
+    // tree-sitter 0.21's string parse path throws a bare "Invalid argument"
+    // for ANY input over 32,768 characters (its default internal buffer).
+    // That failure was previously caught below and turned into an empty
+    // symbol list, so on a real Java codebase every file over 32KB - i.e.
+    // exactly the god-classes and core services where this tool is most
+    // useful - silently indexed as zero symbols, with nothing in the build
+    // output saying so. Sized at 2x the byte length (+1) because the buffer
+    // is measured in bytes while `code` is counted in UTF-16 code units, so
+    // multi-byte content needs the headroom.
+    tree = parser.parse(code, null, { bufferSize: Buffer.byteLength(code, 'utf8') * 2 + 1 });
   } catch (err) {
-    return { symbols: [], imports: [], calls: [], literals: [], error: `parse-failed: ${err.message}` };
+    // Still reachable for genuinely malformed input. Fall back to the
+    // whole-file generic chunk rather than returning nothing: a file that
+    // can't be AST-parsed is still worth having in the index as searchable
+    // text, and `error` is propagated so buildBrain can REPORT the
+    // degradation instead of silently shipping a hole in the graph.
+    const fallback = parseGenericFile(absPath, code);
+    return { ...fallback, error: `parse-failed: ${err.message}` };
   }
 
   const symbols = [];
@@ -80,6 +96,157 @@ function parseFile(absPath, ext, source) {
   const scopeStack = [];
   const currentScope = () => (scopeStack.length ? scopeStack[scopeStack.length - 1] : null);
 
+  // Innermost enclosing class/interface name, so a method symbol records
+  // which type owns it (symbols.parent_name) and a `this.m()` call can name
+  // its own receiver type.
+  const classStack = [];
+  const currentClass = () => (classStack.length ? classStack[classStack.length - 1] : null);
+
+  // varName -> declared type name, for receiver-type resolution of `x.m()`.
+  // Populated from field declarations, formal parameters and local variable
+  // declarations as they're visited. A single flat map per file rather than
+  // a proper lexical scope chain: shadowing across methods is rare in the
+  // code this targets, and a wrong-but-plausible type here can only ever
+  // produce the same ambiguity the name-only fallback already has.
+  const varTypes = new Map();
+  const noteVarType = (name, typeName) => {
+    if (name && typeName && /^[A-Za-z_$][\w$]*$/.test(typeName)) varTypes.set(name, typeName);
+  };
+
+  /**
+   * Strips generics/arrays off a declared type node so `List<Foo>` -> `List`
+   * and `Foo[]` -> `Foo`. The bare head is what matches a class symbol's
+   * name in the index.
+   */
+  function typeNameOf(typeNode) {
+    if (!typeNode) return null;
+    // TS/JS spell a declared type as `type: (type_annotation (type_identifier))`
+    // - unwrap to the annotated type itself.
+    const node = typeNode.type === 'type_annotation' ? typeNode.namedChild(0) : typeNode;
+    if (!node) return null;
+    const head = node.text.split('<')[0].replace(/\[\]/g, '').trim();
+    const last = head.split('.').pop();
+    return /^[A-Za-z_$][\w$]*$/.test(last) ? last : null;
+  }
+
+  /**
+   * Records `varName -> declared type` for every declaration shape across the
+   * supported grammars. Run as a whole-tree pre-pass (see below) rather than
+   * inline during the main visit, so a call site resolves against a field or
+   * local regardless of whether its declaration is visited first - in Java a
+   * field is typically declared above the methods that use it, but nothing
+   * guarantees that, and getting this backwards silently downgrades a call to
+   * the ambiguous name-only path.
+   */
+  function captureDeclaredTypes(node) {
+    switch (node.type) {
+      // Java: `private ProductService productService;` / `Foo f = ...;`
+      // (a `type` field plus one or more variable_declarator children)
+      case 'field_declaration':
+      case 'local_variable_declaration':
+      case 'variable_declaration': {
+        const typeName = typeNameOf(node.childForFieldName('type'));
+        if (!typeName) break;
+        for (const d of node.namedChildren) {
+          if (d.type !== 'variable_declarator') continue;
+          const n = d.childForFieldName('name');
+          if (n) noteVarType(n.text, typeName);
+        }
+        break;
+      }
+      // Java: `void m(UserRepo repo)`. C#: `void M(UserRepo repo)`.
+      case 'formal_parameter':
+      case 'parameter': {
+        const typeName = typeNameOf(node.childForFieldName('type'));
+        const n = node.childForFieldName('name');
+        if (n) noteVarType(n.text, typeName);
+        break;
+      }
+      // TS: `private svc: AuthService;` as a class field.
+      case 'public_field_definition':
+      case 'property_signature': {
+        const n = node.childForFieldName('name');
+        const typeName = typeNameOf(node.childForFieldName('type'));
+        if (n) noteVarType(n.text, typeName);
+        break;
+      }
+      // TS: `constructor(private authService: AuthService)` - the constructor
+      // -injection shape that accounts for essentially every service
+      // reference in an Angular/Nest codebase.
+      case 'required_parameter':
+      case 'optional_parameter': {
+        const pattern = node.childForFieldName('pattern');
+        const typeName = typeNameOf(node.childForFieldName('type'));
+        if (pattern && pattern.type === 'identifier') noteVarType(pattern.text, typeName);
+        break;
+      }
+      // TS: `const x: UserRepo = ...` (JS declarators have no type and are
+      // simply skipped by typeNameOf returning null).
+      case 'variable_declarator': {
+        const n = node.childForFieldName('name');
+        const typeName = typeNameOf(node.childForFieldName('type'));
+        if (n && n.type === 'identifier' && typeName) noteVarType(n.text, typeName);
+        break;
+      }
+      // PHP: `private AuthService $svc;` / `function m(AuthService $svc)`.
+      case 'property_declaration':
+      case 'simple_parameter': {
+        const typeNode = node.namedChildren.find((c) => c.type === 'named_type' || c.type === 'type_list' || c.type === 'primitive_type');
+        const typeName = typeNameOf(typeNode);
+        if (!typeName) break;
+        const varNode = node.descendantsOfType('variable_name')[0];
+        if (varNode) noteVarType(varNode.text.replace(/^\$/, ''), typeName);
+        break;
+      }
+      default:
+        break;
+    }
+    for (const child of node.namedChildren) captureDeclaredTypes(child);
+  }
+
+  /**
+   * The type a call's receiver expression evaluates to, when that's knowable
+   * without real type inference: `this`/bare call -> the enclosing class,
+   * a known variable/field/parameter -> its declared type, an identifier
+   * that is itself a type name (a static call like `Foo.bar()`) -> that type.
+   * Returns null when unknown, which is what keeps the name-only fallback
+   * honest rather than guessing.
+   */
+  function receiverTypeOf(objNode) {
+    if (!objNode) return currentClass(); // bare `m()` - implicitly this.m()
+    if (objNode.type === 'this') return currentClass();
+    if (objNode.type === 'identifier' || objNode.type === 'variable_name' || objNode.type === 'name') {
+      const name = objNode.text.replace(/^\$/, ''); // PHP's `$svc`
+      if (varTypes.has(name)) return varTypes.get(name);
+      if (/^[A-Z]/.test(name)) return name; // `Foo.bar()` - a static call on a type
+      return null;
+    }
+    if (objNode.type === 'field_access') {
+      // `this.svc.m()` / `self.svc.m()` - the field name carries the type
+      const field = objNode.childForFieldName('field');
+      if (field && varTypes.has(field.text)) return varTypes.get(field.text);
+    }
+    if (objNode.type === 'member_expression' || objNode.type === 'attribute') {
+      const prop = objNode.childForFieldName('property') || objNode.childForFieldName('attribute');
+      if (prop && varTypes.has(prop.text)) return varTypes.get(prop.text);
+    }
+    return null;
+  }
+
+  /** Records a call with whatever receiver type could be resolved (may be null). */
+  function pushCall(calleeName, node, calleeNode, receiverType) {
+    const scope = currentScope();
+    if (!calleeName || !scope) return;
+    calls.push({
+      callerName: scope.name,
+      calleeName,
+      receiverType: receiverType || null,
+      line: node.startPosition.row + 1,
+      calleeLine: calleeNode ? calleeNode.startPosition.row : node.startPosition.row,
+      calleeColumn: calleeNode ? calleeNode.startPosition.column : node.startPosition.column
+    });
+  }
+
   function nodeSig(node, name) {
     const startLine = node.startPosition.row + 1;
     const text = code.slice(node.startIndex, Math.min(node.endIndex, node.startIndex + 160));
@@ -98,6 +265,7 @@ function parseFile(absPath, ext, source) {
     const sym = {
       name,
       kind,
+      parentName: kind === 'method' ? currentClass() : null,
       startLine: node.startPosition.row + 1,
       endLine: node.endPosition.row + 1,
       startByte: node.startIndex,
@@ -134,7 +302,9 @@ function parseFile(absPath, ext, source) {
         const nameNode = node.childForFieldName('name');
         const name = nameNode ? nameNode.text : '(anonymous class)';
         pushSymbol(node, name, 'class');
+        classStack.push(name);
         for (const child of node.namedChildren) visit(child);
+        classStack.pop();
         return;
       }
       // JS/TS: `new Foo(...)` - tracked as a call to `Foo` so a class picks
@@ -178,7 +348,9 @@ function parseFile(absPath, ext, source) {
         const nameNode = node.childForFieldName('name');
         const name = nameNode ? nameNode.text : '(anonymous class)';
         pushSymbol(node, name, 'class');
+        classStack.push(name);
         for (const child of node.namedChildren) visit(child);
+        classStack.pop();
         return;
       }
       // Python: `from a.b import c` - childForFieldName('name') isn't set
@@ -209,6 +381,7 @@ function parseFile(absPath, ext, source) {
         const fnNode = node.childForFieldName('function');
         let calleeName = null;
         let calleeNode = null;
+        let receiverNode;
         if (fnNode) {
           if (fnNode.type === 'identifier') {
             calleeName = fnNode.text;
@@ -219,18 +392,10 @@ function parseFile(absPath, ext, source) {
               calleeName = attr.text;
               calleeNode = attr;
             }
+            receiverNode = fnNode.childForFieldName('object');
           }
         }
-        const scope = currentScope();
-        if (calleeName && scope) {
-          calls.push({
-            callerName: scope.name,
-            calleeName,
-            line: node.startPosition.row + 1,
-            calleeLine: calleeNode ? calleeNode.startPosition.row : node.startPosition.row,
-            calleeColumn: calleeNode ? calleeNode.startPosition.column : node.startPosition.column
-          });
-        }
+        pushCall(calleeName, node, calleeNode, receiverTypeOf(receiverNode));
         break;
       }
       // Java: interfaces have no direct JS/TS equivalent in this schema's
@@ -240,7 +405,9 @@ function parseFile(absPath, ext, source) {
         const nameNode = node.childForFieldName('name');
         const name = nameNode ? nameNode.text : '(anonymous interface)';
         pushSymbol(node, name, 'class');
+        classStack.push(name);
         for (const child of node.namedChildren) visit(child);
+        classStack.pop();
         return;
       }
       // Java: method_declaration/constructor_declaration are this
@@ -302,10 +469,7 @@ function parseFile(absPath, ext, source) {
       case 'method_invocation': {
         const nameNode = node.childForFieldName('name');
         const calleeName = nameNode ? nameNode.text : null;
-        const scope = currentScope();
-        if (calleeName && scope) {
-          calls.push({ callerName: scope.name, calleeName, line: node.startPosition.row + 1 });
-        }
+        pushCall(calleeName, node, nameNode, receiverTypeOf(node.childForFieldName('object')));
         break;
       }
       // C#: `using System;` / `using MyApp.Services;` - the target is a
@@ -325,6 +489,7 @@ function parseFile(absPath, ext, source) {
         const fnNode = node.childForFieldName('function');
         let calleeName = null;
         let calleeNode = null;
+        let receiverNode;
         if (fnNode) {
           if (fnNode.type === 'identifier') {
             calleeName = fnNode.text;
@@ -335,18 +500,10 @@ function parseFile(absPath, ext, source) {
               calleeName = nameField.text;
               calleeNode = nameField;
             }
+            receiverNode = fnNode.childForFieldName('expression');
           }
         }
-        const scope = currentScope();
-        if (calleeName && scope) {
-          calls.push({
-            callerName: scope.name,
-            calleeName,
-            line: node.startPosition.row + 1,
-            calleeLine: calleeNode ? calleeNode.startPosition.row : node.startPosition.row,
-            calleeColumn: calleeNode ? calleeNode.startPosition.column : node.startPosition.column
-          });
-        }
+        pushCall(calleeName, node, calleeNode, receiverTypeOf(receiverNode));
         break;
       }
       // PHP: `use App\Services\Helper;` / `use ... as Alias;` - each clause
@@ -366,32 +523,13 @@ function parseFile(absPath, ext, source) {
       // "call" node type the way Python has.
       case 'function_call_expression': {
         const fnNode = node.childForFieldName('function');
-        const calleeName = fnNode ? fnNode.text : null;
-        const scope = currentScope();
-        if (calleeName && scope) {
-          calls.push({
-            callerName: scope.name,
-            calleeName,
-            line: node.startPosition.row + 1,
-            calleeLine: fnNode.startPosition.row,
-            calleeColumn: fnNode.startPosition.column
-          });
-        }
+        pushCall(fnNode ? fnNode.text : null, node, fnNode, null);
         break;
       }
       case 'member_call_expression': {
         const nameNode = node.childForFieldName('name');
         const calleeName = nameNode ? nameNode.text : null;
-        const scope = currentScope();
-        if (calleeName && scope) {
-          calls.push({
-            callerName: scope.name,
-            calleeName,
-            line: node.startPosition.row + 1,
-            calleeLine: nameNode.startPosition.row,
-            calleeColumn: nameNode.startPosition.column
-          });
-        }
+        pushCall(calleeName, node, nameNode, receiverTypeOf(node.childForFieldName('object')));
         break;
       }
       case 'variable_declarator': {
@@ -456,6 +594,11 @@ function parseFile(absPath, ext, source) {
         let calleeName = null;
         let calleeObjectName = null;
         let calleeNode = null;
+        // The receiver expression itself (`this.authService` in
+        // `this.authService.login()`), handed to receiverTypeOf below to
+        // resolve WHICH type's `login` this call actually reaches. Undefined
+        // for a bare `login()`, which receiverTypeOf reads as "this".
+        let calleeReceiverNode;
         if (fnNode) {
           if (fnNode.type === 'identifier') {
             calleeName = fnNode.text;
@@ -467,6 +610,7 @@ function parseFile(absPath, ext, source) {
               calleeName = prop.text;
               calleeNode = prop;
             }
+            calleeReceiverNode = obj;
             if (obj && obj.type === 'identifier') calleeObjectName = obj.text;
           }
         }
@@ -516,16 +660,7 @@ function parseFile(absPath, ext, source) {
           }
         }
 
-        const scope = currentScope();
-        if (calleeName && scope) {
-          calls.push({
-            callerName: scope.name,
-            calleeName,
-            line: node.startPosition.row + 1,
-            calleeLine: calleeNode ? calleeNode.startPosition.row : node.startPosition.row,
-            calleeColumn: calleeNode ? calleeNode.startPosition.column : node.startPosition.column
-          });
-        }
+        pushCall(calleeName, node, calleeNode, receiverTypeOf(calleeReceiverNode));
         break;
       }
       default:
@@ -535,6 +670,7 @@ function parseFile(absPath, ext, source) {
     for (const child of node.namedChildren) visit(child);
   }
 
+  captureDeclaredTypes(tree.rootNode);
   visit(tree.rootNode);
 
   return { symbols, imports, calls, literals };

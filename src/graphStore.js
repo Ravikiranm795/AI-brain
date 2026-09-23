@@ -13,6 +13,40 @@ const FULLY_PARSED_EXTENSION_SET = new Set(FULLY_PARSED_EXTENSIONS);
 // logic file with the same or a weaker token match.
 const GENERIC_FILE_NAME_MATCH_DISCOUNT = 0.5;
 
+// Method names so common across standard libraries, collections, builders and
+// framework base classes that matching them by name alone carries no
+// information. A call to one of these with an UNRESOLVED receiver (see
+// parser.js's receiverTypeOf) gets no target edge at all, rather than
+// fanning out to every same-named method in the repo. Sized deliberately
+// small and literal: this is a denylist of names whose name-only match is
+// known-meaningless, not an attempt to enumerate every standard-library
+// method. Receiver-typed calls are unaffected - `myService.get()` still
+// resolves normally once `myService`'s type is known.
+const AMBIGUOUS_METHOD_NAMES = new Set([
+  // JDK / collections / streams
+  'stream', 'get', 'set', 'add', 'remove', 'put', 'size', 'isEmpty', 'contains', 'clear',
+  'map', 'filter', 'forEach', 'collect', 'sorted', 'reduce', 'anyMatch', 'allMatch', 'findFirst',
+  'iterator', 'next', 'hasNext', 'toList', 'toArray', 'of', 'empty', 'orElse', 'orElseGet', 'ifPresent',
+  // Object / lang basics
+  'toString', 'equals', 'hashCode', 'clone', 'compareTo', 'valueOf', 'parse', 'format', 'trim',
+  'length', 'charAt', 'substring', 'split', 'join', 'replace', 'indexOf', 'startsWith', 'endsWith',
+  // Ubiquitous builder/accessor shapes
+  'build', 'builder', 'create', 'apply', 'accept', 'run', 'call', 'execute', 'close', 'open',
+  'getName', 'getId', 'getValue', 'getType', 'getMessage', 'getKey', 'getData', 'getStatus',
+  'setName', 'setId', 'setValue', 'setType', 'setStatus',
+  // Logging
+  'info', 'warn', 'error', 'debug', 'trace', 'log',
+  // JS/TS promise & console shapes
+  'then', 'catch', 'finally', 'resolve', 'reject', 'all', 'push', 'pop', 'slice', 'splice',
+  'subscribe', 'pipe', 'emit', 'on', 'off', 'once'
+]);
+
+// Resolutions precise enough to make a positive claim from - see
+// insertCallEdges' doc comment. 'heuristic' is deliberately excluded: an
+// edge that only matched by a shared, ambiguous name is fine for "here's
+// somewhere to look" but must never underwrite "this is covered by a test".
+const TRUSTED_RESOLUTIONS = new Set(['typed', 'unique', 'lsp']);
+
 // Splits a file path or symbol name into lowercase word tokens, aware of
 // kebab-case, snake_case, camelCase and path/extension separators - so
 // "generic-filter.component.ts" tokenizes to [generic, filter, component,
@@ -32,7 +66,12 @@ CREATE TABLE IF NOT EXISTS files (
   hash TEXT NOT NULL,
   mtime INTEGER NOT NULL,
   ext TEXT,
-  is_test INTEGER NOT NULL DEFAULT 0
+  is_test INTEGER NOT NULL DEFAULT 0,
+  -- 'ok' | 'parse-failed' | 'too-large' | 'minified'. Anything but 'ok' means
+  -- this file is in the index with degraded (or zero) symbol coverage, so an
+  -- empty answer about a symbol it might contain is "unknown", not "no".
+  -- Queried by getDegradedFiles() and surfaced by query.js's check().
+  index_status TEXT NOT NULL DEFAULT 'ok'
 );
 
 CREATE TABLE IF NOT EXISTS symbols (
@@ -44,7 +83,12 @@ CREATE TABLE IF NOT EXISTS symbols (
   end_line INTEGER NOT NULL,
   start_byte INTEGER NOT NULL,
   end_byte INTEGER NOT NULL,
-  signature TEXT
+  signature TEXT,
+  -- Enclosing class/interface name for a method, null for a top-level
+  -- symbol. This is what lets a call through a typed receiver resolve to
+  -- ONE method instead of every same-named method in the repo - see
+  -- insertCallEdges().
+  parent_name TEXT
 );
 
 CREATE TABLE IF NOT EXISTS edges (
@@ -138,6 +182,9 @@ class GraphStore {
     }
 
     addColumnIfMissing('edges', 'resolution', "resolution TEXT NOT NULL DEFAULT 'heuristic'");
+    addColumnIfMissing('files', 'index_status', "index_status TEXT NOT NULL DEFAULT 'ok'");
+    addColumnIfMissing('edges', 'target_count', 'target_count INTEGER');
+    addColumnIfMissing('symbols', 'parent_name', 'parent_name TEXT');
 
     // `CREATE VIRTUAL TABLE IF NOT EXISTS` above creates chunks_fts empty on
     // a database that already had rows in `chunks` from before FTS existed -
@@ -173,17 +220,18 @@ class GraphStore {
    * is simpler and plenty fast at file granularity (we only do this for
    * files whose hash actually changed).
    */
-  upsertFile(relPath, hash, mtime, ext, parsed) {
+  upsertFile(relPath, hash, mtime, ext, parsed, opts = {}) {
+    const indexStatus = opts.indexStatus || 'ok';
     const tx = this.db.transaction(() => {
       this.deleteFile(relPath);
 
       const fileId = this.db
-        .prepare('INSERT INTO files (path, hash, mtime, ext, is_test) VALUES (?, ?, ?, ?, ?)')
-        .run(relPath, hash, mtime, ext, isTestFile(relPath) ? 1 : 0).lastInsertRowid;
+        .prepare('INSERT INTO files (path, hash, mtime, ext, is_test, index_status) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(relPath, hash, mtime, ext, isTestFile(relPath) ? 1 : 0, indexStatus).lastInsertRowid;
 
       const insertSymbol = this.db.prepare(
-        `INSERT INTO symbols (file_id, name, kind, start_line, end_line, start_byte, end_byte, signature)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO symbols (file_id, name, kind, start_line, end_line, start_byte, end_byte, signature, parent_name)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       // chunks.code now holds the full (capped) symbol body - see parser.js's
       // nodeBody() - so it's actually searchable via chunks_fts, not just the
@@ -206,7 +254,8 @@ class GraphStore {
           sym.endLine,
           sym.startByte,
           sym.endByte,
-          sym.signature
+          sym.signature,
+          sym.parentName != null ? sym.parentName : null
         ).lastInsertRowid;
         nameToSymbolId.set(sym.name, symId);
         insertChunk.run(symId, sym.body != null ? sym.body : sym.signature);
@@ -229,30 +278,101 @@ class GraphStore {
   }
 
   /**
-   * Call-edge resolution is name-based and project-wide: after all files in
-   * this build pass are inserted, look up each recorded call by callee name
-   * anywhere in the graph. Simple, fast, and good enough for "who calls
-   * this" style queries; it can over-match same-named functions across
-   * files, which is a known, documented simplification.
+   * Resolves each recorded call site to the symbol(s) it reaches, in tiers of
+   * decreasing confidence, recorded in `edges.resolution`:
+   *
+   *   'typed'  - the call's receiver type was resolved (see parser.js's
+   *              receiverTypeOf) and that type owns a method by this name.
+   *              One edge, to one symbol. This is a real answer.
+   *   'unique' - exactly one symbol in the whole repo has this name, so
+   *              name-matching can't be wrong even without a receiver type.
+   *   'heuristic' - the name matches several symbols and nothing narrowed it
+   *              down. Edges are still recorded (they're better than nothing
+   *              for navigation) but flagged, counted in `target_count`, and
+   *              excluded from anything that claims certainty - see
+   *              TRUSTED_RESOLUTIONS and query.js's check().
+   *
+   * A call whose name is in AMBIGUOUS_METHOD_NAMES and whose receiver is
+   * unresolved records NO target edge at all. That combination is pure
+   * noise: `list.stream()` matching a `stream()` method on some service
+   * class is what previously produced a 1,722-symbol "blast radius" across
+   * 561 files for a class actually referenced by 3, and reported it as
+   * test-covered.
    */
   insertCallEdges(fileId, calls) {
     const findSrc = this.db.prepare('SELECT id FROM symbols WHERE file_id = ? AND name = ?');
-    const findDst = this.db.prepare('SELECT id FROM symbols WHERE name = ? LIMIT 5');
+    const findTyped = this.db.prepare(
+      'SELECT id FROM symbols WHERE name = ? AND parent_name = ? COLLATE NOCASE LIMIT 2'
+    );
+    const countByName = this.db.prepare('SELECT COUNT(*) AS c FROM symbols WHERE name = ?');
+    const isIndexedClass = this.db.prepare("SELECT 1 AS found FROM symbols WHERE name = ? COLLATE NOCASE AND kind = 'class' LIMIT 1");
+    const findByName = this.db.prepare('SELECT id FROM symbols WHERE name = ? LIMIT 5');
     const insertEdge = this.db.prepare(
-      'INSERT INTO edges (src_symbol_id, dst_symbol_id, dst_name, kind) VALUES (?, ?, ?, ?)'
+      'INSERT INTO edges (src_symbol_id, dst_symbol_id, dst_name, kind, resolution, target_count) VALUES (?, ?, ?, ?, ?, ?)'
     );
 
     const tx = this.db.transaction(() => {
       for (const call of calls) {
         const src = findSrc.get(fileId, call.callerName);
         if (!src) continue;
-        const dsts = findDst.all(call.calleeName);
-        if (dsts.length === 0) {
-          insertEdge.run(src.id, null, call.calleeName, 'calls');
-        } else {
-          for (const dst of dsts) {
-            insertEdge.run(src.id, dst.id, call.calleeName, 'calls');
+
+        const total = countByName.get(call.calleeName).c;
+
+        if (call.receiverType) {
+          // Tier 1: the receiver's type owns a method by this name. A real
+          // answer - one edge, one target.
+          const typed = findTyped.all(call.calleeName, call.receiverType);
+          if (typed.length) {
+            for (const dst of typed) insertEdge.run(src.id, dst.id, call.calleeName, 'calls', 'typed', typed.length);
+            continue;
           }
+          // Tier 1b: the receiver's type isn't a class this repo defines at
+          // all (List, String, Optional, a framework base class). The call
+          // therefore lands OUTSIDE the index, and any same-named symbol in
+          // here is a coincidence, not the callee. Recorded with no target.
+          //
+          // This is the single most important negative case in this method.
+          // `items.stream()` on a List does not call some service's stream()
+          // method - but name-matching alone can't tell, and when a repo
+          // happens to define exactly one stream() the uniqueness tier below
+          // would "confidently" link every list.stream() in the codebase to
+          // it. That is precisely how a class referenced by 3 files acquired
+          // a 1,722-symbol blast radius across 561 files, reported as
+          // test-covered.
+          if (!isIndexedClass.get(call.receiverType)) {
+            insertEdge.run(src.id, null, call.calleeName, 'calls', 'external', total);
+            continue;
+          }
+          // Otherwise: the type IS ours but has no such method - inherited,
+          // or a field the parser mistyped. Fall through, but never as
+          // 'unique' (see below), since we have positive evidence the naive
+          // name match is not the whole story.
+        }
+
+        // Tier 2: a name whose bare match carries no information, with no
+        // receiver type to disambiguate it. Recorded with no target rather
+        // than fanned out across every same-named symbol.
+        if (AMBIGUOUS_METHOD_NAMES.has(call.calleeName)) {
+          insertEdge.run(src.id, null, call.calleeName, 'calls', 'heuristic', total);
+          continue;
+        }
+
+        // Tier 3: exactly one symbol in the repo has this name, and nothing
+        // above contradicted it - name-matching cannot be wrong here.
+        if (total === 1 && !call.receiverType) {
+          const dst = findByName.get(call.calleeName);
+          insertEdge.run(src.id, dst.id, call.calleeName, 'calls', 'unique', 1);
+          continue;
+        }
+
+        // Tier 4: ambiguous. Edges are still recorded as leads, flagged and
+        // counted, and excluded from anything that claims certainty.
+        if (total === 0) {
+          insertEdge.run(src.id, null, call.calleeName, 'calls', 'heuristic', 0);
+          continue;
+        }
+        for (const dst of findByName.all(call.calleeName)) {
+          insertEdge.run(src.id, dst.id, call.calleeName, 'calls', 'heuristic', total);
         }
       }
     });
@@ -269,6 +389,28 @@ class GraphStore {
     this.db
       .prepare('INSERT INTO edges (src_symbol_id, dst_symbol_id, dst_name, kind, resolution) VALUES (?, ?, ?, ?, ?)')
       .run(srcSymbolId, dstSymbolId, calleeName, 'calls', 'lsp');
+  }
+
+  /**
+   * Records a file the walker deliberately did NOT index (too large,
+   * minified) as a row with no symbols, purely so its absence is
+   * discoverable afterwards. Without this the file is indistinguishable
+   * from one that doesn't exist, which is what let a 484KB ProductService.java
+   * silently vanish from a blast-radius answer that still reported success.
+   */
+  recordSkippedFile(relPath, reason, mtime) {
+    const tx = this.db.transaction(() => {
+      this.deleteFile(relPath);
+      this.db
+        .prepare('INSERT INTO files (path, hash, mtime, ext, is_test, index_status) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(relPath, 'skipped', mtime || 0, path.extname(relPath), isTestFile(relPath) ? 1 : 0, reason);
+    });
+    tx();
+  }
+
+  /** Every file in the index with degraded or zero symbol coverage - see files.index_status. */
+  getDegradedFiles() {
+    return this.db.prepare("SELECT id, path, index_status FROM files WHERE index_status != 'ok'").all();
   }
 
   getSymbolById(id) {
@@ -538,20 +680,25 @@ class GraphStore {
     if (!resolved) return { callers: [], meta: {} };
     const { seeds, meta } = resolved;
 
-    const incoming = this.db.prepare('SELECT src_symbol_id AS id FROM edges WHERE dst_symbol_id = ?');
+    const incoming = this.db.prepare('SELECT src_symbol_id AS id, resolution, target_count FROM edges WHERE dst_symbol_id = ?');
     const visited = new Set(seeds);
-    let frontier = [...seeds];
+    // A caller is only as trustworthy as the weakest edge on the path that
+    // reached it - one ambiguous name-match anywhere in the chain makes the
+    // whole attribution a guess, so `trusted` is ANDed along the path rather
+    // than read off the final edge.
+    let frontier = seeds.map((id) => ({ id, trusted: true }));
     const callers = [];
 
     for (let h = 1; h <= maxHops && frontier.length; h++) {
       const next = [];
-      for (const id of frontier) {
-        for (const row of incoming.all(id)) {
+      for (const node of frontier) {
+        for (const row of incoming.all(node.id)) {
           if (visited.has(row.id)) continue;
           visited.add(row.id);
           const sym = this.getSymbolById(row.id);
           if (!sym) continue;
           const file = this.getFileById(sym.file_id);
+          const trusted = node.trusted && TRUSTED_RESOLUTIONS.has(row.resolution);
           callers.push({
             symbolId: sym.id,
             name: sym.name,
@@ -560,9 +707,15 @@ class GraphStore {
             startLine: sym.start_line,
             endLine: sym.end_line,
             relation: 'caller',
-            hops: h
+            hops: h,
+            resolution: row.resolution,
+            // How many symbols shared this callee name at resolution time -
+            // present only when the match was ambiguous, as a direct measure
+            // of how much salt to take this caller with.
+            ...(TRUSTED_RESOLUTIONS.has(row.resolution) ? {} : { nameMatchedSymbols: row.target_count }),
+            confidence: trusted ? 'high' : 'low'
           });
-          next.push(row.id);
+          next.push({ id: row.id, trusted });
         }
       }
       frontier = next;
@@ -588,10 +741,16 @@ class GraphStore {
           endLine: peer.symbol.end_line,
           relation: 'shares-storage-key',
           sharedKey: peer.key,
-          hops: 0
+          hops: 0,
+          resolution: 'storage-key',
+          confidence: 'high'
         });
       }
     }
+
+    // Most-trustworthy and nearest first, so a truncated view keeps the part
+    // worth reading rather than whatever the traversal happened to reach.
+    callers.sort((a, b) => (a.confidence === b.confidence ? a.hops - b.hops : a.confidence === 'high' ? -1 : 1));
 
     return { callers, meta };
   }
@@ -607,24 +766,25 @@ class GraphStore {
     if (!resolved) return { tests: [], meta: {} };
     const { seeds, meta } = resolved;
 
-    const incoming = this.db.prepare('SELECT src_symbol_id AS id FROM edges WHERE dst_symbol_id = ?');
+    const incoming = this.db.prepare('SELECT src_symbol_id AS id, resolution FROM edges WHERE dst_symbol_id = ?');
     const lookup = this.db.prepare(
       `SELECT s.id, s.name, s.kind, s.start_line, s.end_line, f.path AS file_path, f.is_test
        FROM symbols s JOIN files f ON f.id = s.file_id WHERE s.id = ?`
     );
 
     const visited = new Set(seeds);
-    let frontier = [...seeds];
+    let frontier = seeds.map((id) => ({ id, trusted: true }));
     const hits = [];
 
     for (let h = 1; h <= maxHops && frontier.length; h++) {
       const next = [];
-      for (const id of frontier) {
-        for (const row of incoming.all(id)) {
+      for (const node of frontier) {
+        for (const row of incoming.all(node.id)) {
           if (visited.has(row.id)) continue;
           visited.add(row.id);
           const sym = lookup.get(row.id);
           if (!sym) continue;
+          const trusted = node.trusted && TRUSTED_RESOLUTIONS.has(row.resolution);
           if (sym.is_test) {
             hits.push({
               symbolId: sym.id,
@@ -633,15 +793,21 @@ class GraphStore {
               path: sym.file_path,
               startLine: sym.start_line,
               endLine: sym.end_line,
-              hops: h
+              hops: h,
+              // A test reached only through an ambiguous name-match is NOT
+              // evidence of coverage - query.js's check() requires at least
+              // one high-confidence hit before it will say "covered".
+              confidence: trusted ? 'high' : 'low'
             });
           } else {
-            next.push(row.id);
+            next.push({ id: row.id, trusted });
           }
         }
       }
       frontier = next;
     }
+
+    hits.sort((a, b) => (a.confidence === b.confidence ? a.hops - b.hops : a.confidence === 'high' ? -1 : 1));
 
     return { tests: hits, meta };
   }

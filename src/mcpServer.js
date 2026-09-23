@@ -61,18 +61,31 @@ function createServer() {
       inputSchema: {
         path: z.string().optional(),
         symbolId: z.number().int().describe('Symbol id from a brain_search/brain_context result'),
-        hops: z.number().int().positive().optional().describe('Hop count (default 1)')
+        hops: z.number().int().positive().optional().describe('Hop count (default 1)'),
+        limit: z.number().int().positive().optional().describe('Max related symbols to return (default 60)'),
+        offset: z.number().int().nonnegative().optional().describe('Pagination offset into the related list (default 0)')
       }
     },
-    async ({ path: p, symbolId, hops }) => {
+    async ({ path: p, symbolId, hops, limit, offset }) => {
       const rootDir = resolveRoot(p);
       const { store } = storeCache.get(getRepoBrainDir(rootDir));
       const result = query.expand(rootDir, symbolId, hops || 1, { store });
       if (!result) return textResult({ error: `No symbol with id ${symbolId}` });
       const { related, classAggregation } = result;
-      const annotated = related.map((r) => ({ ...r, alreadyShown: r.symbolId ? session.isSymbolShown(r.symbolId) : false }));
-      annotated.forEach((r) => { if (r.symbolId) session.markSymbolShown(r.symbolId); });
-      return textResult(classAggregation ? { related: annotated, classAggregation } : { related: annotated });
+      // Paged for the same reason brain_check's blast radius is: a 2-hop
+      // expand on a busy symbol has come back at ~300KB, which no caller can
+      // use and every caller pays for.
+      const start = offset || 0;
+      const max = limit || 60;
+      const page = related.slice(start, start + max);
+      return textResult({
+        related: page,
+        total: related.length,
+        returned: page.length,
+        offset: start,
+        truncated: related.length > start + page.length,
+        ...(classAggregation ? { classAggregation } : {})
+      });
     }
   );
 
@@ -86,12 +99,21 @@ function createServer() {
         relPath: z.string().describe('File path relative to the repo root'),
         startLine: z.number().int().positive(),
         endLine: z.number().int().positive(),
-        force: z.boolean().optional().describe('Resend content even if already shown this session')
+        force: z.boolean().optional().describe('Resend content even if already shown this session'),
+        dedupe: z.boolean().optional().describe('Suppress content already returned this session (default false - see the server note on shared sessions)')
       }
     },
-    async ({ path: p, relPath, startLine, endLine, force }) => {
+    async ({ path: p, relPath, startLine, endLine, force, dedupe }) => {
       const rootDir = resolveRoot(p);
-      const alreadyShown = !force && session.isRangeShown(relPath, startLine, endLine);
+      // Dedup is OPT-IN. One stdio server process is shared by every agent on
+      // the other end - subagents included - but SessionState is per process,
+      // so "already shown" was being answered for a different agent than the
+      // one asking. A parallel subagent would get `content: null,
+      // alreadyShown: true` for a range it had never seen and had no way to
+      // know it was being lied to. A duplicate read wastes tokens; a false
+      // alreadyShown silently removes code from an agent's view, which is
+      // strictly worse.
+      const alreadyShown = !!dedupe && !force && session.isRangeShown(relPath, startLine, endLine);
       if (alreadyShown) {
         return textResult({ content: null, alreadyShown: true, relPath, startLine, endLine });
       }
@@ -121,10 +143,11 @@ function createServer() {
         hops: z.number().int().positive().optional(),
         budgetChars: z.number().int().positive().optional(),
         kind: z.string().optional(),
-        ext: z.string().optional()
+        ext: z.string().optional(),
+        dedupe: z.boolean().optional().describe('Suppress code already returned this session (default false - see the server note on shared sessions)')
       }
     },
-    async ({ path: p, task, k, hops, budgetChars, kind, ext }) => {
+    async ({ path: p, task, k, hops, budgetChars, kind, ext, dedupe }) => {
       const rootDir = resolveRoot(p);
       const { store, vectorIndex } = storeCache.get(getRepoBrainDir(rootDir));
       const result = await buildContext(rootDir, task, { k, hops, budgetChars, kind, ext }, { store, vectorIndex });
@@ -132,17 +155,23 @@ function createServer() {
       // Already-shown items are demoted to signature-only first, ahead of
       // hop distance, since re-sending code the agent already has is the
       // most wasteful use of the char budget.
-      for (const item of [...result.primary, ...result.neighbors]) {
-        if (item.symbolId && session.isSymbolShown(item.symbolId) && item.code) {
-          item.code = null;
-          item.alreadyShown = true;
-        } else {
-          item.alreadyShown = false;
+      // Opt-in for the same reason brain_read's is - see the note there. One
+      // server process serves every agent on the connection, so suppressing
+      // code "already shown" can blank out code the asking agent has never
+      // seen.
+      if (dedupe) {
+        for (const item of [...result.primary, ...result.neighbors]) {
+          if (item.symbolId && session.isSymbolShown(item.symbolId) && item.code) {
+            item.code = null;
+            item.alreadyShown = true;
+          } else {
+            item.alreadyShown = false;
+          }
         }
-      }
-      for (const item of [...result.primary, ...result.neighbors]) {
-        if (item.symbolId) session.markSymbolShown(item.symbolId);
-        if (item.path && item.startLine && item.endLine) session.markRangeShown(item.path, item.startLine, item.endLine);
+        for (const item of [...result.primary, ...result.neighbors]) {
+          if (item.symbolId) session.markSymbolShown(item.symbolId);
+          if (item.path && item.startLine && item.endLine) session.markRangeShown(item.path, item.startLine, item.endLine);
+        }
       }
 
       return textResult(result);
@@ -153,18 +182,25 @@ function createServer() {
     'brain_check',
     {
       title: 'Pre-edit impact + test-coverage check',
-      description: "Blast radius (transitive callers) and test coverage for a symbol, before editing it. risk is one of 'covered' (a test calls into it), 'untested' (no test found, but the graph walk actually ran), or 'unresolved' (a class/interface with zero discoverable members - the walk never ran, so an empty blastRadius here means unknown, not safe).",
+      description:
+        "Blast radius (transitive callers) and test coverage for a symbol, before editing it. risk is one of: 'covered' (a test " +
+        "reaches it through high-confidence edges), 'untested' (the walk ran and found none), 'incomplete' (some file that " +
+        "mentions this symbol is not fully indexed - see indexGaps; the answer is MISSING callers, so grep those files), or " +
+        "'unresolved' (a class/interface with zero discoverable members - the walk never ran). Only 'covered' and 'untested' " +
+        'are actual findings; the other two mean "unknown", never "safe". Each blastRadius entry carries confidence: high ' +
+        '(receiver-type-resolved, uniquely-named, or LSP-resolved) or low (matched only by a shared method name - treat as a lead, not a fact).',
       inputSchema: {
         path: z.string().optional(),
         symbolId: z.number().int(),
         hops: z.number().int().positive().optional(),
-        testHops: z.number().int().positive().optional()
+        testHops: z.number().int().positive().optional(),
+        maxCallers: z.number().int().positive().optional().describe('Max blast-radius entries to return (default 40; the summary always reports full totals)')
       }
     },
-    async ({ path: p, symbolId, hops, testHops }) => {
+    async ({ path: p, symbolId, hops, testHops, maxCallers }) => {
       const rootDir = resolveRoot(p);
       const { store } = storeCache.get(getRepoBrainDir(rootDir));
-      const result = query.check(rootDir, symbolId, { hops, testHops }, { store });
+      const result = query.check(rootDir, symbolId, { hops, testHops, maxCallers }, { store });
       if (!result) return textResult({ error: `No symbol with id ${symbolId}` });
       return textResult(result);
     }

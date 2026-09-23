@@ -35,13 +35,26 @@ Run these from a terminal at the root of this repo (or any subfolder):
 - \`brain read <path> <startLine> <endLine>\` - read only that exact slice of
   a file, instead of opening the whole file.
 - \`brain check <symbolId>\` - before editing something: reports its blast
-  radius (transitive callers) and whether any test covers it. \`risk\` is one
-  of \`covered\`, \`untested\`, or \`unresolved\` - **treat \`unresolved\` as
-  "unknown", not "safe"**: it means the symbol is a class/interface with no
-  discoverable members (e.g. a TS interface, or a class the parser found no
-  methods in), so the blast-radius walk never actually ran. An empty
-  \`blastRadius\` alongside \`unresolved\` is not a finding of "nothing calls
-  this".
+  radius (transitive callers) and whether any test covers it. \`risk\` is one of:
+  - \`covered\` - a test reaches it through high-confidence edges.
+  - \`untested\` - the walk ran and genuinely found none.
+  - \`incomplete\` - a file that mentions this symbol isn't fully indexed
+    (see \`indexGaps\`), so callers are **missing** from this answer. Grep
+    those files directly.
+  - \`unresolved\` - a class/interface with no discoverable members; the walk
+    never ran at all.
+
+  **Only \`covered\` and \`untested\` are findings. \`incomplete\` and
+  \`unresolved\` mean "unknown" and must never be read as "safe to change".**
+  Each blast-radius entry also carries \`confidence\`: \`high\` (the call was
+  resolved through the receiver's type, a repo-unique name, or a language
+  server) or \`low\` (matched only by a shared method name - a lead to verify,
+  not a fact).
+- **Check the build's "Index health" line before trusting a negative
+  answer.** If it reports degraded files (parse failures or size skips),
+  those files are not in the symbol graph, and an empty search/blast-radius
+  result may simply mean "brain couldn't see it". \`brain check\` flags this
+  per-symbol as \`risk: "incomplete"\`, but a plain \`brain search\` miss won't.
 - \`brain build\` - re-run after making changes. It is incremental: only
   files whose content actually changed are re-parsed and re-embedded, so
   repeat runs on an already-indexed repo are fast. Add \`--force\` to rebuild

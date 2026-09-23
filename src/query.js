@@ -31,6 +31,68 @@ const GENERIC_FILE_SCORE_DISCOUNT = 0.5;
 // userConfig.js.
 const DEFAULT_RRF_K = 60;
 
+// Hard cap on how many blast-radius entries brain_check serializes. Without
+// one, a check on a heavily-used symbol has produced a ~800KB response -
+// unusable by any MCP client, and absurd for a tool whose premise is
+// spending fewer tokens than reading the files would. The full totals are
+// always reported alongside, so a capped answer is never mistakable for a
+// complete one. Override per-call with `maxCallers`.
+const DEFAULT_MAX_CALLERS = 40;
+
+// Above this many symbols sharing one exact name, the exact-identifier boost
+// is treated as ambiguous and skipped entirely - see its use in search().
+const MAX_EXACT_MATCH_SYMBOLS = 5;
+
+/**
+ * Words in a query that are plausibly CODE identifiers rather than English.
+ * This distinction is the whole safety margin on the exact-identifier boost:
+ * the boost forces a symbol to the top of the results, so firing it on a
+ * plain word is actively harmful. A benchmark of the previous version found
+ * exactly that - "parse publication year from pub-date element" force-ranked
+ * four unrelated `parse` methods, and every query containing the word
+ * "Service" force-ranked classes literally named `Service`, pushing the real
+ * answers off the list.
+ *
+ * A word qualifies only with structural evidence that it was written as
+ * code, never on length alone:
+ *   - an internal capital, i.e. camelCase/PascalCase compounds
+ *     (`parseBookMeta`, `ProductService`) but NOT `Product`, `parse`, or a
+ *     capitalized sentence opener
+ *   - an underscore (`snake_case`, `CONST_NAME`)
+ *   - dotted or ::-qualified (`Foo.bar`, `Foo::bar`) - only the final
+ *     segment is returned, which is what symbol names are stored as
+ *   - wrapped in backticks by the caller, an explicit "this is code" signal
+ *     that overrides all of the above
+ */
+function extractIdentifierWords(queryText) {
+  const words = new Set();
+
+  // Backticked spans are taken at face value, including bare words.
+  for (const m of queryText.matchAll(/`([^`]+)`/g)) {
+    const inner = m[1].trim();
+    const seg = inner.split(/[.:#]+/).pop();
+    if (/^[A-Za-z_$][\w$]*$/.test(seg)) words.add(seg);
+  }
+
+  for (const m of queryText.matchAll(/[A-Za-z_$][\w$]*(?:[.:]{1,2}[A-Za-z_$][\w$]*)*/g)) {
+    const token = m[0];
+    const isDotted = /[.:]/.test(token);
+    const segments = token.split(/[.:]+/).filter(Boolean);
+    segments.forEach((seg, i) => {
+      if (seg.length < 3) return;
+      const isFinalSegment = i === segments.length - 1;
+      const hasInternalCapital = /[a-z0-9][A-Z]/.test(seg);
+      const hasUnderscore = seg.includes('_');
+      // Every segment of a dotted token is worth matching (`ProductService.getProducts`
+      // names two real symbols, not one), but a bare undotted word still has
+      // to earn it structurally.
+      if (hasInternalCapital || hasUnderscore || (isDotted && isFinalSegment)) words.add(seg);
+    });
+  }
+
+  return [...words];
+}
+
 /**
  * `deps` lets callers that already have an open store/index (context.js's
  * multi-step assembly, the long-lived MCP server) reuse them instead of
@@ -102,9 +164,16 @@ async function search(rootDir, queryText, k = 10, filters = {}, deps = {}) {
     // symbol - a real identifier that short would be unusual and low-value
     // to boost this hard anyway.
     const EXACT_MATCH_BONUS = 10;
-    const identifierWords = [...new Set((queryText.match(/[A-Za-z_][A-Za-z0-9_]*/g) || []).filter((w) => w.length >= 4))];
-    for (const word of identifierWords) {
-      for (const id of store.getSymbolsByExactName(word)) {
+    for (const word of extractIdentifierWords(queryText)) {
+      const ids = store.getSymbolsByExactName(word);
+      // An "exact" match that hits dozens of symbols isn't identifying
+      // anything - it's a common name (an overload set, an interface and its
+      // implementations, a method defined on every DTO). Forcing all of them
+      // to the top would bury the ranked results under a wall of ties, so
+      // past this threshold the boost stands down and the normal three-signal
+      // fusion decides.
+      if (!ids.length || ids.length > MAX_EXACT_MATCH_SYMBOLS) continue;
+      for (const id of ids) {
         const cur = fused.get(id) || { score: 0, matches: 0, hasLexicalHit: false };
         cur.score += EXACT_MATCH_BONUS;
         cur.matches += 1;
@@ -215,13 +284,55 @@ function read(rootDir, relPath, startLine, endLine) {
   return lines.slice(s - 1, Math.min(lines.length, e)).join('\n');
 }
 
+// Bounds the raw-text scan below. The degraded set should be tiny (a
+// handful of oversized or unparseable files); if a repo somehow has
+// hundreds, scanning them all on every check() is not worth the latency -
+// the first N are enough to establish "this answer is incomplete", which is
+// the actual finding.
+const MAX_GAP_FILES_SCANNED = 50;
+
+/**
+ * Files that are part of the repo but NOT fully in the symbol index (parse
+ * failure, size-skipped - see graphStore's files.index_status) and whose raw
+ * text mentions `symbolName`. Each one is a place a caller could be hiding
+ * where no graph walk can reach it.
+ *
+ * The literal text scan is the point: these files have no symbols to query,
+ * so the only way to know whether they're relevant is to look at the bytes.
+ * Cheap in practice because the degraded set is small, and infinitely better
+ * than reporting a confident empty blast radius that simply couldn't see
+ * half the repo.
+ */
+function findIndexGapsMentioning(rootDir, store, symbolName) {
+  if (!symbolName || symbolName.length < 3) return [];
+  let degraded;
+  try {
+    degraded = store.getDegradedFiles();
+  } catch (_) {
+    return []; // pre-migration brain without the index_status column
+  }
+  if (!degraded.length) return [];
+
+  const gaps = [];
+  for (const f of degraded.slice(0, MAX_GAP_FILES_SCANNED)) {
+    let text;
+    try {
+      text = fs.readFileSync(path.resolve(rootDir, f.path), 'utf8');
+    } catch (_) {
+      continue; // deleted/unreadable since the build - nothing to report
+    }
+    if (text.includes(symbolName)) gaps.push({ path: f.path, reason: f.index_status });
+  }
+  return gaps;
+}
+
 /**
  * Pre-edit safety report for a symbol: who transitively calls it (blast
  * radius) and which tests, if any, exercise it - so an agent can gauge risk
  * before changing it instead of finding out after the fact.
  */
 function check(rootDir, symbolId, opts = {}, deps = {}) {
-  const { hops = 3, testHops = 6 } = opts;
+  const { hops = 3, testHops = 6, maxCallers = DEFAULT_MAX_CALLERS } = opts;
   const brainDir = getRepoBrainDir(rootDir);
   const store = deps.store || new GraphStore(brainDir);
   const shouldClose = !deps.store;
@@ -231,9 +342,24 @@ function check(rootDir, symbolId, opts = {}, deps = {}) {
     if (!symbol) return null;
     const file = store.getFileById(symbol.file_id);
 
-    const { callers: blastRadius, meta: callerMeta } = store.getCallers(id, Number(hops));
+    const { callers: allCallers, meta: callerMeta } = store.getCallers(id, Number(hops));
     const { tests: testsCovering, meta: testMeta } = store.getTestsForSymbol(id, Number(testHops));
     const classAggregation = callerMeta.classAggregation || testMeta.classAggregation || null;
+
+    // Cap the response. An unbounded blast radius on a widely-used symbol
+    // has come back at ~800KB in one call - far past what any MCP client can
+    // use, and self-defeating for a tool whose whole pitch is spending fewer
+    // tokens than reading files directly. Highest-confidence, nearest hops
+    // are kept first (see graphStore's sort), and the summary below still
+    // reports the full totals so a truncated answer never reads as a
+    // complete one.
+    const blastRadius = allCallers.slice(0, maxCallers);
+    const byFile = new Map();
+    for (const c of allCallers) {
+      const key = c.path || '(unknown)';
+      byFile.set(key, (byFile.get(key) || 0) + 1);
+    }
+    const highConfidenceCallers = allCallers.filter((c) => c.confidence === 'high').length;
     // A class/interface with zero discoverable members (see graphStore.js's
     // _resolveSeeds) means the walk never actually ran - an empty
     // blastRadius/testsCovering there is NOT the same finding as "we looked
@@ -243,6 +369,26 @@ function check(rootDir, symbolId, opts = {}, deps = {}) {
     // as its biggest risk: an agent could take an empty, unresolved result
     // as "safe to change" instead of "unknown".
     const unresolved = !!(classAggregation && classAggregation.unresolved);
+
+    // Index gaps: a file that's in the repo but has degraded or zero symbol
+    // coverage (parse failure, size-skipped - see graphStore's index_status)
+    // and mentions this symbol's name in its raw text is a caller this walk
+    // structurally COULD NOT see. Reporting an empty blast radius without
+    // saying so is the single most dangerous output this tool can produce,
+    // and the reason `risk` has an 'incomplete' value at all.
+    const indexGaps = findIndexGapsMentioning(rootDir, store, symbol.name);
+
+    // A test reached only through an ambiguous name-match is not evidence of
+    // coverage - see graphStore's TRUSTED_RESOLUTIONS. `stream()` matching
+    // every list.stream() in a repo previously produced 916 "covering tests"
+    // for a class with none.
+    const confidentTests = testsCovering.filter((t) => t.confidence === 'high');
+
+    let risk;
+    if (unresolved) risk = 'unresolved';
+    else if (indexGaps.length) risk = 'incomplete';
+    else if (confidentTests.length) risk = 'covered';
+    else risk = 'untested';
 
     return {
       symbol: {
@@ -254,8 +400,25 @@ function check(rootDir, symbolId, opts = {}, deps = {}) {
         endLine: symbol.end_line
       },
       blastRadius,
+      blastRadiusSummary: {
+        total: allCallers.length,
+        shown: blastRadius.length,
+        truncated: allCallers.length > blastRadius.length,
+        highConfidence: highConfidenceCallers,
+        lowConfidence: allCallers.length - highConfidenceCallers,
+        files: byFile.size,
+        topFiles: [...byFile.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15).map(([path, count]) => ({ path, count }))
+      },
       testsCovering,
-      risk: unresolved ? 'unresolved' : testsCovering.length > 0 ? 'covered' : 'untested',
+      risk,
+      ...(indexGaps.length
+        ? {
+            indexGaps,
+            indexGapWarning:
+              `${indexGaps.length} file(s) mention "${symbol.name}" but are not fully indexed, so this blast radius is ` +
+              `INCOMPLETE - callers in those files cannot appear here. Grep them directly, and see the build output for why they were skipped.`
+          }
+        : {}),
       ...(classAggregation ? { classAggregation } : {})
     };
   } finally {

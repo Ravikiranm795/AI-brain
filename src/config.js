@@ -155,10 +155,24 @@ function isTestFile(relPath) {
   return TEST_FILE_PATTERNS.some((re) => re.test(relPath));
 }
 
-// Files above this size are skipped by the walker regardless of extension -
-// a single-file override isn't worth the config surface; a legitimate source
-// file this large is itself a smell. See walker.js's walk().
-const MAX_FILE_SIZE_BYTES = 300 * 1024;
+// Files above this size are skipped by the walker regardless of extension.
+// Raised from an earlier 300KB after real-repo benchmarking: "a source file
+// that large is itself a smell" was true but exactly backwards as a policy -
+// the god-classes it excluded (a 484KB ProductService.java, its test, and
+// several 300KB+ helpers) are precisely the files where "what breaks if I
+// change this" is hardest to answer by hand and most valuable to index. The
+// cap now exists only to bound pathological input (generated/vendored
+// blobs), not to make a judgement about code style. Overridable per-repo via
+// brain.config.json's `maxFileSizeBytes` - see userConfig.js. Whatever is
+// still skipped is now REPORTED rather than silently dropped (see walker.js).
+const MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024;
+
+/** MAX_FILE_SIZE_BYTES unless overridden by brain.config.json's `maxFileSizeBytes`. */
+function getEffectiveMaxFileSize(rootDir) {
+  const user = loadUserConfig(rootDir, getBrainsHome());
+  const v = Number(user.maxFileSizeBytes);
+  return Number.isFinite(v) && v > 0 ? v : MAX_FILE_SIZE_BYTES;
+}
 
 // Early-warning margin below vectorIndex.js's documented ~200k-symbol
 // brute-force-search ceiling (see its class doc comment).
@@ -210,5 +224,6 @@ module.exports = {
   VECTOR_INDEX_WARN_THRESHOLD,
   getEffectiveIgnoreDirs,
   getEffectiveSupportedExtensions,
+  getEffectiveMaxFileSize,
   isTestFile
 };

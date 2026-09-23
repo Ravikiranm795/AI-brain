@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { walkProject } = require('./walker');
-const { hashFile } = require('./hasher');
+const { hashFile, hashBuffer, warmHasher } = require('./hasher');
 const { parseFile } = require('./parser');
 const { GraphStore } = require('./graphStore');
 const { embedBatch } = require('./embedder');
@@ -20,9 +20,22 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
   onProgress(`Repo: ${root}`);
   onProgress(`Brain: ${brainDir}`);
 
+  await warmHasher(); // so the parse loop below can hash synchronously from a buffer it already holds
+
   // 1. Walk (the one and only full traversal)
-  const walked = walkProject(root);
+  const { files: walked, skipped, maxFileSize } = walkProject(root);
   onProgress(`Found ${walked.length} source files`);
+  if (skipped.length) {
+    const tooLarge = skipped.filter((s) => s.reason === 'too-large');
+    if (tooLarge.length) {
+      onProgress(
+        `WARNING: ${tooLarge.length} file(s) skipped for exceeding the ${(maxFileSize / 1024 / 1024).toFixed(1)}MB size cap - ` +
+        `they are NOT in the index and will not appear in any search or blast radius. Raise brain.config.json's ` +
+        `"maxFileSizeBytes" to include them: ${tooLarge.slice(0, 10).map((s) => `${s.relPath} (${Math.round(s.size / 1024)}KB)`).join(', ')}` +
+        `${tooLarge.length > 10 ? `, +${tooLarge.length - 10} more` : ''}`
+      );
+    }
+  }
 
   // 2. Hash every file, diff against the last manifest
   const priorManifest = force ? null : readManifest(brainDir);
@@ -36,13 +49,37 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
   }
   force = force || contentUpgrade;
   const manifest = force ? { version: 1, rootDir: root, builtAt: null, files: {} } : priorManifest;
-  const hashed = [];
-  for (const f of walked) {
-    const hash = await hashFile(f.absPath);
-    const stat = fs.statSync(f.absPath);
-    hashed.push({ ...f, hash, mtime: stat.mtimeMs });
+
+  // A forced build re-processes every file regardless of hash, so hashing
+  // up front is pure waste - it's a second full read of the entire repo
+  // whose answer is discarded. Skipped entirely here; the parse loop below
+  // hashes from the buffer it already has to read anyway. On an incremental
+  // build the hashes ARE the diff, so they're computed here, with progress:
+  // this pass reads every file in the repo and used to sit silent for a
+  // minute-plus on a large one, looking indistinguishable from a hang.
+  let changed;
+  let added;
+  let unchanged;
+  let deleted;
+  if (force) {
+    changed = [];
+    added = walked; // hash/mtime filled in by the parse loop below, from the buffer it reads anyway
+    unchanged = [];
+    deleted = []; // nothing to diff against - a forced build wipes the store outright (see store.clearAll below)
+  } else {
+    const hashT0 = Date.now();
+    const hashed = [];
+    for (const f of walked) {
+      const hash = await hashFile(f.absPath);
+      const stat = fs.statSync(f.absPath);
+      hashed.push({ ...f, hash, mtime: stat.mtimeMs });
+      if (hashed.length % 500 === 0) {
+        onProgress(`  ...hashed ${hashed.length}/${walked.length} files (${((hashed.length / walked.length) * 100).toFixed(0)}%)`);
+      }
+    }
+    onProgress(`Hashed ${walked.length} files in ${((Date.now() - hashT0) / 1000).toFixed(1)}s`);
+    ({ changed, added, unchanged, deleted } = diffAgainstManifest(manifest, hashed));
   }
-  const { changed, added, unchanged, deleted } = diffAgainstManifest(manifest, hashed);
   onProgress(`Changed: ${changed.length}, Added: ${added.length}, Unchanged: ${unchanged.length}, Deleted: ${deleted.length}`);
 
   const store = new GraphStore(brainDir);
@@ -84,6 +121,10 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
     const toProcess = [...changed, ...added];
     let processedCount = 0;
     const parseT0 = Date.now();
+    // Every file whose AST parse failed and fell back to a whole-file
+    // generic chunk (see parser.js) - collected so the build can report the
+    // degradation instead of leaving a silent hole in the symbol graph.
+    const parseFailures = [];
     // Call-edge resolution is deferred to a further pass below (see the
     // comment there for why) - collect each file's parsed calls here first.
     const pendingCallEdges = [];
@@ -102,9 +143,19 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
         vectorIndex.removeIds(oldSymbolIds);
       }
 
-      const source = fs.readFileSync(f.absPath, 'utf8');
+      // Read once as a Buffer and derive both the hash and the text from it -
+      // on a forced build the hash pass above is skipped precisely so this is
+      // the only read of each file in the whole build.
+      const buf = fs.readFileSync(f.absPath);
+      const source = buf.toString('utf8');
+      const hash = f.hash !== undefined ? f.hash : hashBuffer(buf);
+      const mtime = f.mtime !== undefined ? f.mtime : fs.statSync(f.absPath).mtimeMs;
+
       const parsed = parseFile(f.absPath, f.ext, source);
-      const { fileId } = store.upsertFile(f.relPath, f.hash, f.mtime, f.ext, parsed);
+      if (parsed.error) parseFailures.push({ relPath: f.relPath, error: parsed.error });
+      const { fileId } = store.upsertFile(f.relPath, hash, mtime, f.ext, parsed, {
+        indexStatus: parsed.error ? 'parse-failed' : 'ok'
+      });
       pendingCallEdges.push({ fileId, relPath: f.relPath, ext: f.ext, source, calls: parsed.calls });
 
       const symbolRows = store.db.prepare('SELECT id, name, kind, signature FROM symbols WHERE file_id = ?').all(fileId);
@@ -112,7 +163,7 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
         pendingEmbeds.push({ id: sym.id, text: `${sym.kind} ${sym.name}: ${sym.signature}` });
       }
 
-      manifest.files[f.relPath] = { hash: f.hash, mtime: f.mtime };
+      manifest.files[f.relPath] = { hash, mtime };
       processedCount++;
       if (processedCount % 100 === 0 || processedCount === toProcess.length) {
         const pct = ((processedCount / toProcess.length) * 100).toFixed(0);
@@ -132,10 +183,26 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
       store.insertCallEdges(fileId, calls);
     }
 
+    // Record the files the walker deliberately left out, so they're
+    // discoverable as index GAPS rather than simply absent - query.js's
+    // check() reads these back to downgrade a blast radius to
+    // risk: "incomplete" when one of them mentions the symbol.
+    for (const s of skipped) {
+      store.recordSkippedFile(s.relPath, s.reason, 0);
+    }
+
     // One global batched embedding pass - see the comment above pendingEmbeds
     // for why this replaces the old one-batch-per-file loop.
     const EMBED_BATCH_SIZE = 256;
     const embedT0 = Date.now();
+    if (pendingEmbeds.length) {
+      // The embedding model (~90MB of ONNX weights) loads lazily on the first
+      // embed call and can take the better part of a minute on a cold cache.
+      // Announcing it costs nothing and turns an apparent hang into a known
+      // wait - this gap was previously the longest unexplained silence in a
+      // large build.
+      onProgress(`Embedding ${pendingEmbeds.length} symbols (loading the embedding model first - this can take ~30s on first use)...`);
+    }
     for (let i = 0; i < pendingEmbeds.length; i += EMBED_BATCH_SIZE) {
       const batch = pendingEmbeds.slice(i, i + EMBED_BATCH_SIZE);
       const vecs = await embedBatch(batch.map((b) => b.text));
@@ -172,12 +239,44 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
     // Cheap to read back later (see config.js's summarizeManifest/
     // listAllRepoBrains) without opening graph.sqlite just to answer "how
     // big is this brain" for a listing.
-    manifest.stats = { filesTotal: walked.length, symbols: totalSymbols, vectors: vectorIndex.size };
+    manifest.stats = {
+      filesTotal: walked.length,
+      symbols: totalSymbols,
+      vectors: vectorIndex.size,
+      // Index health, persisted so it's visible later (brain_list) and not
+      // just in the scrollback of whoever happened to run the build.
+      parseFailures: parseFailures.length,
+      filesSkipped: skipped.length,
+      degradedFiles: [
+        ...parseFailures.map((p) => ({ path: p.relPath, reason: 'parse-failed' })),
+        ...skipped.map((s) => ({ path: s.relPath, reason: s.reason }))
+      ].slice(0, 100)
+    };
     writeManifest(brainDir, manifest);
 
     if (instructions) writeInstructions(root, brainDir, repoId);
 
     onProgress(`Done. ${totalSymbols} symbols indexed. Vector index size: ${vectorIndex.size}`);
+
+    // Index health, reported LAST so it's the thing left on screen. A build
+    // that quietly indexed zero symbols for a sixth of the repo used to
+    // print nothing but "Done" - every downstream answer was then wrong in a
+    // way nothing in the output hinted at.
+    if (parseFailures.length) {
+      onProgress(
+        `WARNING: ${parseFailures.length} file(s) failed to parse and are indexed as plain text only (no functions/classes/call edges): ` +
+        `${parseFailures.slice(0, 10).map((p) => p.relPath).join(', ')}${parseFailures.length > 10 ? `, +${parseFailures.length - 10} more` : ''}`
+      );
+    }
+    const degradedTotal = parseFailures.length + skipped.length;
+    if (degradedTotal) {
+      onProgress(
+        `Index health: ${walked.length - parseFailures.length} of ${walked.length + skipped.length} files fully indexed, ` +
+        `${degradedTotal} degraded. brain_check will report risk:"incomplete" for symbols these files mention.`
+      );
+    } else {
+      onProgress('Index health: all files fully indexed, no parse failures or skips.');
+    }
     // vectorIndex.js documents a ~200k-symbol design ceiling for its
     // brute-force cosine search (no ANN structure) - warn well before that,
     // so a growing repo gets a heads-up instead of a silent slowdown.
@@ -198,6 +297,8 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
         added: added.length,
         unchanged: unchanged.length,
         deleted: deleted.length,
+        parseFailures: parseFailures.length,
+        filesSkipped: skipped.length,
         symbols: totalSymbols,
         vectors: vectorIndex.size
       }

@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const ignoreLib = require('ignore');
-const { MAX_FILE_SIZE_BYTES, getEffectiveIgnoreDirs, getEffectiveSupportedExtensions } = require('./config');
+const { getEffectiveMaxFileSize, getEffectiveIgnoreDirs, getEffectiveSupportedExtensions } = require('./config');
 
 // Minified bundles slip through directory-name-based ignores (they're often
 // checked in outside node_modules/dist/build, e.g. a vendored `jquery.min.js`
@@ -15,10 +15,18 @@ const MINIFIED_RE = /\.min\.(js|css)$/i;
  * Walks the project ONCE. This is the only full directory traversal the
  * whole tool ever does per build - after this, everything is done through
  * the manifest hash diff, never a re-walk of the same size.
+ *
+ * Returns `{ files, skipped }`. `skipped` is what this walk deliberately
+ * left out for a reason the user might care about (size, minification) and
+ * exists so the build can REPORT it - an earlier version returned a bare
+ * array and dropped oversized files on the floor with no trace, which on a
+ * real repo silently removed its six largest service classes from the index
+ * while every command still reported success.
  */
 function walkProject(rootDir) {
   const ignoreDirs = getEffectiveIgnoreDirs(rootDir);
   const supportedExtensions = getEffectiveSupportedExtensions(rootDir);
+  const maxFileSize = getEffectiveMaxFileSize(rootDir);
 
   const ig = ignoreLib();
   ig.add(ignoreDirs.map((d) => `${d}/`));
@@ -29,6 +37,7 @@ function walkProject(rootDir) {
   }
 
   const results = [];
+  const skipped = [];
 
   function walk(dir) {
     let entries;
@@ -54,7 +63,6 @@ function walkProject(rootDir) {
 
         const ext = path.extname(entry.name);
         if (!supportedExtensions.has(ext)) continue;
-        if (MINIFIED_RE.test(entry.name)) continue;
 
         let size = 0;
         try {
@@ -62,7 +70,15 @@ function walkProject(rootDir) {
         } catch (_) {
           continue; // race with a deleted file, permission error, etc.
         }
-        if (size > MAX_FILE_SIZE_BYTES) continue;
+
+        if (MINIFIED_RE.test(entry.name)) {
+          skipped.push({ relPath: rel, size, reason: 'minified' });
+          continue;
+        }
+        if (size > maxFileSize) {
+          skipped.push({ relPath: rel, size, reason: 'too-large' });
+          continue;
+        }
 
         results.push({ absPath: abs, relPath: rel, ext });
       }
@@ -70,7 +86,7 @@ function walkProject(rootDir) {
   }
 
   walk(rootDir);
-  return results;
+  return { files: results, skipped, maxFileSize };
 }
 
 module.exports = { walkProject };
