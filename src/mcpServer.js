@@ -8,7 +8,7 @@ const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio
 const query = require('./query');
 const { buildContext } = require('./context');
 const { buildBrain } = require('./buildBrain');
-const { getRepoBrainDir, listAllRepoBrains, getBrainsHome } = require('./config');
+const { getRepoBrainDir, getRepoId, listAllRepoBrains, summarizeManifest, getBrainsHome } = require('./config');
 const { StoreCache } = require('./storeCache');
 const { SessionState } = require('./session');
 
@@ -57,7 +57,7 @@ function createServer() {
     'brain_expand',
     {
       title: 'Expand callers/callees',
-      description: 'Get callers/callees of a symbol, N hops out.',
+      description: 'Get callers/callees of a symbol, N hops out. For a class/interface, results are unioned across its member methods (a call almost never attributes to the class itself) - check classAggregation.unresolved before trusting an empty result: true means there were zero discoverable members (e.g. a TS interface) and nothing was actually resolved, not that the class has no callers.',
       inputSchema: {
         path: z.string().optional(),
         symbolId: z.number().int().describe('Symbol id from a brain_search/brain_context result'),
@@ -67,11 +67,12 @@ function createServer() {
     async ({ path: p, symbolId, hops }) => {
       const rootDir = resolveRoot(p);
       const { store } = storeCache.get(getRepoBrainDir(rootDir));
-      const related = query.expand(rootDir, symbolId, hops || 1, { store });
-      if (!related) return textResult({ error: `No symbol with id ${symbolId}` });
+      const result = query.expand(rootDir, symbolId, hops || 1, { store });
+      if (!result) return textResult({ error: `No symbol with id ${symbolId}` });
+      const { related, classAggregation } = result;
       const annotated = related.map((r) => ({ ...r, alreadyShown: r.symbolId ? session.isSymbolShown(r.symbolId) : false }));
       annotated.forEach((r) => { if (r.symbolId) session.markSymbolShown(r.symbolId); });
-      return textResult({ related: annotated });
+      return textResult(classAggregation ? { related: annotated, classAggregation } : { related: annotated });
     }
   );
 
@@ -152,7 +153,7 @@ function createServer() {
     'brain_check',
     {
       title: 'Pre-edit impact + test-coverage check',
-      description: 'Blast radius (transitive callers) and test coverage for a symbol, before editing it.',
+      description: "Blast radius (transitive callers) and test coverage for a symbol, before editing it. risk is one of 'covered' (a test calls into it), 'untested' (no test found, but the graph walk actually ran), or 'unresolved' (a class/interface with zero discoverable members - the walk never ran, so an empty blastRadius here means unknown, not safe).",
       inputSchema: {
         path: z.string().optional(),
         symbolId: z.number().int(),
@@ -203,11 +204,36 @@ function createServer() {
     'brain_list',
     {
       title: 'List indexed repos',
-      description: 'List every repo currently indexed in the central brains store.',
-      inputSchema: {}
+      description:
+        "By default, summarizes just THIS repo's own brain (path defaults to the current directory) - not every repo ever " +
+        'indexed on the machine. Pass all:true to list every indexed repo instead, paginated via limit/offset. Every entry ' +
+        'is a lightweight summary (rootDir/builtAt/fileCount/stats), never the full per-file manifest.',
+      inputSchema: {
+        path: z.string().optional().describe('Repo root to summarize (default: current directory). Ignored when all is true.'),
+        all: z.boolean().optional().describe('List every repo indexed on this machine instead of just this one'),
+        limit: z.number().int().positive().optional().describe('Max repos to return when all is true (default 20)'),
+        offset: z.number().int().nonnegative().optional().describe('Pagination offset when all is true (default 0)')
+      }
     },
-    async () => {
-      return textResult({ brainsHome: getBrainsHome(), repos: listAllRepoBrains() });
+    async ({ path: p, all, limit, offset }) => {
+      const brainsHome = getBrainsHome();
+      if (!all) {
+        const rootDir = resolveRoot(p);
+        const repoId = getRepoId(rootDir);
+        const brainDir = getRepoBrainDir(rootDir);
+        const summary = summarizeManifest(path.join(brainDir, 'manifest.json'));
+        const { total } = listAllRepoBrains({ limit: 0 });
+        return textResult({
+          brainsHome,
+          repo: summary
+            ? { repoId, dir: brainDir, built: true, ...summary }
+            : { repoId, dir: brainDir, built: false, note: 'No brain built yet for this path - run brain_build first.' },
+          otherReposIndexedOnThisMachine: Math.max(0, total - (summary ? 1 : 0)),
+          note: 'Pass all:true to list every repo indexed on this machine (paginated).'
+        });
+      }
+      const { repos, total } = listAllRepoBrains({ limit: limit || 20, offset: offset || 0 });
+      return textResult({ brainsHome, repos, total, returned: repos.length, offset: offset || 0 });
     }
   );
 

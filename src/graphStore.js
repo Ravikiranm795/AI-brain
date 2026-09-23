@@ -309,6 +309,18 @@ class GraphStore {
   }
 
   /**
+   * Exact (case-insensitive) name match for a single identifier-like query
+   * word, e.g. "AuthService" - see query.js's search() for how this is used:
+   * a query that already names a real symbol is a far stronger, unambiguous
+   * signal than anything semantic/lexical scoring produces, and closes the
+   * gap where a plain grep for a known name is more reliable than semantic
+   * search, which can rank an unrelated-but-similar-sounding hit above it.
+   */
+  getSymbolsByExactName(name) {
+    return this.db.prepare('SELECT id FROM symbols WHERE name = ? COLLATE NOCASE').all(name).map((r) => r.id);
+  }
+
+  /**
    * Third search signal alongside vectorIndex's semantic search and
    * searchLexical's FTS5 body search: how well the query matches a symbol's
    * OWN name or its file's path/basename - neither of the other two signals
@@ -405,10 +417,63 @@ class GraphStore {
       .filter(Boolean);
   }
 
+  /**
+   * A class/interface's member methods, parsed as separate 'method' symbols
+   * within its line range (see parser.js's class_declaration/class_definition
+   * cases, which never push the class itself onto scopeStack). This is why a
+   * class-level query needs special handling everywhere below: a call made
+   * through `new Foo()` or `this.method()` attributes to the METHOD symbol,
+   * never to the enclosing class, so the class symbol itself almost always
+   * has zero direct edges even when it's used constantly. A TS `interface`
+   * shares the 'class' kind (see parser.js's interface_declaration comment)
+   * but its members are `method_signature` nodes, which parser.js doesn't
+   * capture as symbols at all - so this correctly comes back empty for an
+   * interface, which _resolveSeeds() below turns into an explicit
+   * `unresolved` flag instead of a silently-confident "no callers".
+   */
+  getClassMembers(symbol) {
+    if (!symbol || symbol.kind !== 'class') return [];
+    return this.db
+      .prepare(
+        `SELECT id, name, kind FROM symbols
+         WHERE file_id = ? AND id != ? AND kind = 'method'
+           AND start_line >= ? AND end_line <= ?`
+      )
+      .all(symbol.file_id, symbol.id, symbol.start_line, symbol.end_line);
+  }
+
+  /**
+   * Turns a single requested symbol id into the full set of graph seeds a
+   * caller/callee/test walk should start from, plus metadata describing that
+   * expansion. For anything but a class this is just `[symbolId]` and empty
+   * meta - identical to the pre-aggregation behavior. For a class, the seeds
+   * also include every member method (see getClassMembers), so
+   * getCallers/expand/getTestsForSymbol below transparently union "who calls
+   * this class" into "who calls any of its methods" - instead of reporting a
+   * falsely-confident empty result. `unresolved: true` marks the one case
+   * that's genuinely indeterminate: a class/interface with zero discoverable
+   * members, where an empty result means "couldn't look" not "looked and
+   * found nothing".
+   */
+  _resolveSeeds(symbolId) {
+    const symbol = this.getSymbolById(Number(symbolId));
+    if (!symbol) return null;
+    const members = this.getClassMembers(symbol);
+    const seeds = [symbol.id, ...members.map((m) => m.id)];
+    const meta = symbol.kind === 'class'
+      ? { classAggregation: { memberCount: members.length, unresolved: members.length === 0 } }
+      : {};
+    return { symbol, seeds, meta };
+  }
+
   /** Callers of + callees from a given symbol, `hops` deep, plus its direct storage-key peers (see getStorageKeyPeers). */
   expand(symbolId, hops = 1) {
-    const visited = new Set([symbolId]);
-    let frontier = [symbolId];
+    const resolved = this._resolveSeeds(symbolId);
+    if (!resolved) return { items: [], meta: {} };
+    const { seeds, meta } = resolved;
+
+    const visited = new Set(seeds);
+    let frontier = [...seeds];
     const related = [];
 
     const outgoing = this.db.prepare('SELECT * FROM edges WHERE src_symbol_id = ?');
@@ -436,20 +501,24 @@ class GraphStore {
     }
 
     // Storage-key coupling is a second, independent edge kind (see
-    // getStorageKeyPeers) - only checked against the root symbol, not
-    // chained through each hop, since "shares a storage key with a peer of
-    // a peer" isn't a meaningful transitive relation the way calls are.
-    for (const peer of this.getStorageKeyPeers(symbolId)) {
-      if (visited.has(peer.symbolId)) continue;
-      visited.add(peer.symbolId);
-      related.push({ symbolId: peer.symbolId, relation: 'shares-storage-key', via: symbolId, sharedKey: peer.key });
+    // getStorageKeyPeers) - only checked against the seed set, not chained
+    // through each hop, since "shares a storage key with a peer of a peer"
+    // isn't a meaningful transitive relation the way calls are.
+    for (const seed of seeds) {
+      for (const peer of this.getStorageKeyPeers(seed)) {
+        if (visited.has(peer.symbolId)) continue;
+        visited.add(peer.symbolId);
+        related.push({ symbolId: peer.symbolId, relation: 'shares-storage-key', via: seed, sharedKey: peer.key });
+      }
     }
 
-    return related.map((r) => ({ ...r, symbol: this.getSymbolById(r.symbolId), file: null })).map((r) => {
+    const items = related.map((r) => ({ ...r, symbol: this.getSymbolById(r.symbolId), file: null })).map((r) => {
       const sym = r.symbol;
       const file = sym ? this.getFileById(sym.file_id) : null;
       return { ...r, file };
     });
+
+    return { items, meta };
   }
 
   /**
@@ -465,9 +534,13 @@ class GraphStore {
    * radius, where that distinction is the whole point.
    */
   getCallers(symbolId, maxHops = 3) {
+    const resolved = this._resolveSeeds(symbolId);
+    if (!resolved) return { callers: [], meta: {} };
+    const { seeds, meta } = resolved;
+
     const incoming = this.db.prepare('SELECT src_symbol_id AS id FROM edges WHERE dst_symbol_id = ?');
-    const visited = new Set([Number(symbolId)]);
-    let frontier = [Number(symbolId)];
+    const visited = new Set(seeds);
+    let frontier = [...seeds];
     const callers = [];
 
     for (let h = 1; h <= maxHops && frontier.length; h++) {
@@ -500,23 +573,27 @@ class GraphStore {
     // radius purposes they're exactly the kind of thing that breaks if
     // `symbolId` changes - a reader of a key that this symbol's writer stops
     // writing. Reported flat (not hop-chained) alongside true callers.
-    for (const peer of this.getStorageKeyPeers(Number(symbolId))) {
-      if (visited.has(peer.symbolId)) continue;
-      visited.add(peer.symbolId);
-      callers.push({
-        symbolId: peer.symbolId,
-        name: peer.symbol.name,
-        kind: peer.symbol.kind,
-        path: peer.file ? peer.file.path : null,
-        startLine: peer.symbol.start_line,
-        endLine: peer.symbol.end_line,
-        relation: 'shares-storage-key',
-        sharedKey: peer.key,
-        hops: 0
-      });
+    // Checked across the whole seed set (see _resolveSeeds) so a class's
+    // member methods contribute their storage-key peers too.
+    for (const seed of seeds) {
+      for (const peer of this.getStorageKeyPeers(seed)) {
+        if (visited.has(peer.symbolId)) continue;
+        visited.add(peer.symbolId);
+        callers.push({
+          symbolId: peer.symbolId,
+          name: peer.symbol.name,
+          kind: peer.symbol.kind,
+          path: peer.file ? peer.file.path : null,
+          startLine: peer.symbol.start_line,
+          endLine: peer.symbol.end_line,
+          relation: 'shares-storage-key',
+          sharedKey: peer.key,
+          hops: 0
+        });
+      }
     }
 
-    return callers;
+    return { callers, meta };
   }
 
   /**
@@ -526,14 +603,18 @@ class GraphStore {
    * `brain check` to answer "is this covered by any test".
    */
   getTestsForSymbol(symbolId, maxHops = 6) {
+    const resolved = this._resolveSeeds(symbolId);
+    if (!resolved) return { tests: [], meta: {} };
+    const { seeds, meta } = resolved;
+
     const incoming = this.db.prepare('SELECT src_symbol_id AS id FROM edges WHERE dst_symbol_id = ?');
     const lookup = this.db.prepare(
       `SELECT s.id, s.name, s.kind, s.start_line, s.end_line, f.path AS file_path, f.is_test
        FROM symbols s JOIN files f ON f.id = s.file_id WHERE s.id = ?`
     );
 
-    const visited = new Set([Number(symbolId)]);
-    let frontier = [Number(symbolId)];
+    const visited = new Set(seeds);
+    let frontier = [...seeds];
     const hits = [];
 
     for (let h = 1; h <= maxHops && frontier.length; h++) {
@@ -562,7 +643,7 @@ class GraphStore {
       frontier = next;
     }
 
-    return hits;
+    return { tests: hits, meta };
   }
 
   /** Everything needed to render the whole graph in the HTML visualizer. */

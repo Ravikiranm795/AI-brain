@@ -85,6 +85,34 @@ async function search(rootDir, queryText, k = 10, filters = {}, deps = {}) {
     lexicalHits.forEach((h, i) => addHit(h.symbolId, i, true));
     nameHits.forEach((h, i) => addHit(h.symbolId, i, false));
 
+    // Fourth signal, applied directly to the fused score rather than as a
+    // ranked list: does the query literally name a real symbol? E.g. a query
+    // like "trace AuthService login" already tells you the exact thing to
+    // find - that's a far stronger, unambiguous signal than anything
+    // semantic/lexical scoring produces, and it's exactly the gap a prior
+    // benchmark of this tool found: a plain grep for a known symbol name beat
+    // semantic search, which ranked an unrelated-but-similar-sounding hit
+    // (a "remote login" settings page for a query about the login flow)
+    // above the real target. EXACT_MATCH_BONUS dwarfs the largest possible
+    // RRF score (at most ~3/(rrfK+1), one rank-0 hit from each of the three
+    // signals above) so a genuine exact-name match always sorts first,
+    // rather than merely nudging it up a few places. Only identifier-shaped
+    // words of 4+ chars are checked, so short common words in the query text
+    // (e.g. "the", "flow") can't spuriously "exact match" a same-named
+    // symbol - a real identifier that short would be unusual and low-value
+    // to boost this hard anyway.
+    const EXACT_MATCH_BONUS = 10;
+    const identifierWords = [...new Set((queryText.match(/[A-Za-z_][A-Za-z0-9_]*/g) || []).filter((w) => w.length >= 4))];
+    for (const word of identifierWords) {
+      for (const id of store.getSymbolsByExactName(word)) {
+        const cur = fused.get(id) || { score: 0, matches: 0, hasLexicalHit: false };
+        cur.score += EXACT_MATCH_BONUS;
+        cur.matches += 1;
+        cur.hasLexicalHit = true; // an exact name match is real, not a filename coincidence - exempt from the generic-file discount below
+        fused.set(id, cur);
+      }
+    }
+
     // See GENERIC_FILE_SCORE_DISCOUNT above: a generic-parsed-file symbol
     // without a real lexical hit against its actual content only got here
     // via filename-driven signals, so its total score is discounted before
@@ -144,8 +172,8 @@ function expand(rootDir, symbolId, hops = 1, deps = {}) {
     // (indistinguishable from "no callers/callees"). Mirror check()'s
     // null-for-not-found so callers can tell the two cases apart.
     if (!store.getSymbolById(id)) return null;
-    const related = store.expand(id, Number(hops));
-    return related.map((r) => ({
+    const { items, meta } = store.expand(id, Number(hops));
+    const related = items.map((r) => ({
       relation: r.relation,
       symbolId: r.symbol ? r.symbol.id : null,
       name: r.symbol ? r.symbol.name : null,
@@ -155,6 +183,14 @@ function expand(rootDir, symbolId, hops = 1, deps = {}) {
       endLine: r.symbol ? r.symbol.end_line : null,
       sharedKey: r.sharedKey
     }));
+    // See graphStore.js's _resolveSeeds(): a class/interface's own symbol
+    // almost never has direct call edges (its methods do), so `related` here
+    // is already unioned across its members. classAggregation.unresolved
+    // means there were zero discoverable members (e.g. a TS interface, whose
+    // members parser.js doesn't capture as symbols at all) - an empty
+    // `related` in that case means "couldn't look", not "looked, found
+    // nothing", and callers should not read it as a confident answer.
+    return meta.classAggregation ? { related, classAggregation: meta.classAggregation } : { related };
   } finally {
     if (shouldClose) store.close();
   }
@@ -195,8 +231,18 @@ function check(rootDir, symbolId, opts = {}, deps = {}) {
     if (!symbol) return null;
     const file = store.getFileById(symbol.file_id);
 
-    const blastRadius = store.getCallers(id, Number(hops));
-    const testsCovering = store.getTestsForSymbol(id, Number(testHops));
+    const { callers: blastRadius, meta: callerMeta } = store.getCallers(id, Number(hops));
+    const { tests: testsCovering, meta: testMeta } = store.getTestsForSymbol(id, Number(testHops));
+    const classAggregation = callerMeta.classAggregation || testMeta.classAggregation || null;
+    // A class/interface with zero discoverable members (see graphStore.js's
+    // _resolveSeeds) means the walk never actually ran - an empty
+    // blastRadius/testsCovering there is NOT the same finding as "we looked
+    // and this really has no callers/tests". Surface that as its own `risk`
+    // value instead of the misleadingly confident 'untested', which is
+    // exactly the false-safe reading a prior benchmark of this tool flagged
+    // as its biggest risk: an agent could take an empty, unresolved result
+    // as "safe to change" instead of "unknown".
+    const unresolved = !!(classAggregation && classAggregation.unresolved);
 
     return {
       symbol: {
@@ -209,7 +255,8 @@ function check(rootDir, symbolId, opts = {}, deps = {}) {
       },
       blastRadius,
       testsCovering,
-      risk: testsCovering.length > 0 ? 'covered' : 'untested'
+      risk: unresolved ? 'unresolved' : testsCovering.length > 0 ? 'covered' : 'untested',
+      ...(classAggregation ? { classAggregation } : {})
     };
   } finally {
     if (shouldClose) store.close();

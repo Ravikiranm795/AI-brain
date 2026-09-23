@@ -197,15 +197,16 @@ program
   .description('List every repo currently indexed in the central brains store')
   .action(() => {
     console.log(`Brains home: ${getBrainsHome()}\n`);
-    const repos = listAllRepoBrains();
-    if (!repos.length) {
+    const { repos, total } = listAllRepoBrains();
+    if (!total) {
       console.log('No repos indexed yet. Run "brain build" inside a repo.');
       return;
     }
     for (const r of repos) {
-      const builtAt = r.manifest ? r.manifest.builtAt : 'unknown';
-      const rootDir = r.manifest ? r.manifest.rootDir : 'unknown';
-      console.log(`- ${r.repoId}\n    root: ${rootDir}\n    built: ${builtAt}\n    dir:  ${r.dir}`);
+      console.log(
+        `- ${r.repoId}\n    root: ${r.rootDir || 'unknown'}\n    built: ${r.builtAt || 'unknown'}\n` +
+        `    files: ${r.fileCount ?? 'unknown'}\n    dir:  ${r.dir}`
+      );
     }
   });
 

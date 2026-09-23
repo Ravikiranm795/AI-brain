@@ -35,7 +35,13 @@ Run these from a terminal at the root of this repo (or any subfolder):
 - \`brain read <path> <startLine> <endLine>\` - read only that exact slice of
   a file, instead of opening the whole file.
 - \`brain check <symbolId>\` - before editing something: reports its blast
-  radius (transitive callers) and whether any test covers it.
+  radius (transitive callers) and whether any test covers it. \`risk\` is one
+  of \`covered\`, \`untested\`, or \`unresolved\` - **treat \`unresolved\` as
+  "unknown", not "safe"**: it means the symbol is a class/interface with no
+  discoverable members (e.g. a TS interface, or a class the parser found no
+  methods in), so the blast-radius walk never actually ran. An empty
+  \`blastRadius\` alongside \`unresolved\` is not a finding of "nothing calls
+  this".
 - \`brain build\` - re-run after making changes. It is incremental: only
   files whose content actually changed are re-parsed and re-embedded, so
   repeat runs on an already-indexed repo are fast. Add \`--force\` to rebuild

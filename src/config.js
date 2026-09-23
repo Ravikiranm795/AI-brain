@@ -56,24 +56,54 @@ function getRepoBrainDir(rootDir) {
   return ensureDirExists(dir);
 }
 
-function listAllRepoBrains() {
+/**
+ * Reads one repo's manifest.json and extracts a lightweight summary of it -
+ * never the raw manifest object itself. manifest.files is a hash/mtime entry
+ * PER FILE the repo has ever indexed (thousands of entries on a real repo);
+ * returning it verbatim (as this used to) is what made brain_list dump
+ * hundreds of thousands of characters across every repo ever indexed on the
+ * machine - see listAllRepoBrains()'s doc comment.
+ */
+function summarizeManifest(manifestPath) {
+  if (!fs.existsSync(manifestPath)) return null;
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    return {
+      rootDir: manifest.rootDir || null,
+      builtAt: manifest.builtAt || null,
+      contentVersion: manifest.contentVersion || null,
+      fileCount: manifest.files ? Object.keys(manifest.files).length : null,
+      // Populated by buildBrain.js as of this manifest's build - see its
+      // `manifest.stats` write - absent on a manifest from before that field
+      // existed.
+      stats: manifest.stats || null
+    };
+  } catch (_) {
+    return null; // corrupt manifest - summarize as "no info" rather than fail the whole listing
+  }
+}
+
+/**
+ * Lightweight summaries only (see summarizeManifest) - the full per-file
+ * manifest is never returned here, and the result is paginated (`limit`/
+ * `offset`) rather than always returning every repo ever indexed on the
+ * machine, both specifically to fix a real failure mode: on a machine with
+ * many indexed repos this used to return hundreds of thousands of characters
+ * in one call, blowing an MCP client's token budget outright. Returns
+ * `{ repos, total }` so a caller can tell "you're seeing repos 1-20" from
+ * "there are only 20 repos total".
+ */
+function listAllRepoBrains({ limit, offset = 0 } = {}) {
   const home = getBrainsHome();
-  return fs
-    .readdirSync(home, { withFileTypes: true })
-    .filter((d) => d.isDirectory())
-    .map((d) => {
-      const dir = path.join(home, d.name);
-      const manifestPath = path.join(dir, 'manifest.json');
-      let manifest = null;
-      if (fs.existsSync(manifestPath)) {
-        try {
-          manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-        } catch (_) {
-          /* ignore corrupt manifest */
-        }
-      }
-      return { repoId: d.name, dir, manifest };
-    });
+  const dirs = fs.readdirSync(home, { withFileTypes: true }).filter((d) => d.isDirectory());
+  const total = dirs.length;
+  const page = typeof limit === 'number' ? dirs.slice(offset, offset + limit) : dirs.slice(offset);
+  const repos = page.map((d) => {
+    const dir = path.join(home, d.name);
+    const summary = summarizeManifest(path.join(dir, 'manifest.json'));
+    return { repoId: d.name, dir, ...(summary || { rootDir: null, builtAt: null, contentVersion: null, fileCount: null, stats: null }) };
+  });
+  return { repos, total };
 }
 
 // Languages with real tree-sitter symbol/call extraction (see src/parser.js).
@@ -172,6 +202,7 @@ module.exports = {
   getRepoId,
   getRepoBrainDir,
   listAllRepoBrains,
+  summarizeManifest,
   SUPPORTED_EXTENSIONS,
   FULLY_PARSED_EXTENSIONS,
   DEFAULT_IGNORE_DIRS,

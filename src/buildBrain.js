@@ -73,12 +73,23 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
       delete manifest.files[relPath];
     }
 
-    // 4. Re-parse + re-embed only what changed or is new
+    // 4. Re-parse what changed or is new (fast: no I/O beyond one read per
+    // file, tree-sitter parsing, and sqlite writes). Embedding - the actual
+    // bottleneck, an ONNX forward pass per call - is deferred to one global
+    // batched pass below instead of running once per file: transformers.js's
+    // per-call overhead (tokenization setup, tensor allocation) dominates at
+    // small batch sizes, so 3,000 single-file batches of ~5 symbols each is
+    // far slower than a few dozen batches of hundreds - same total symbols
+    // embedded, far fewer round trips into the runtime.
     const toProcess = [...changed, ...added];
     let processedCount = 0;
-    // Call-edge resolution is deferred to a second pass below (see the
+    const parseT0 = Date.now();
+    // Call-edge resolution is deferred to a further pass below (see the
     // comment there for why) - collect each file's parsed calls here first.
     const pendingCallEdges = [];
+    // { id, text } for every new/changed symbol across ALL files in this
+    // pass - fed to the single embedBatch pass below instead of per file.
+    const pendingEmbeds = [];
 
     for (const f of toProcess) {
       // Wipe stale vectors for this file's old symbol ids before replacing
@@ -96,17 +107,20 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
       const { fileId } = store.upsertFile(f.relPath, f.hash, f.mtime, f.ext, parsed);
       pendingCallEdges.push({ fileId, relPath: f.relPath, ext: f.ext, source, calls: parsed.calls });
 
-      // Embed this file's new symbols in one batched forward pass instead
-      // of one await per symbol - see embedder.js's embedBatch().
       const symbolRows = store.db.prepare('SELECT id, name, kind, signature FROM symbols WHERE file_id = ?').all(fileId);
-      const texts = symbolRows.map((sym) => `${sym.kind} ${sym.name}: ${sym.signature}`);
-      const vecs = await embedBatch(texts);
-      const pairs = symbolRows.map((sym, i) => [sym.id, vecs[i]]);
-      if (pairs.length) vectorIndex.addBatch(pairs);
+      for (const sym of symbolRows) {
+        pendingEmbeds.push({ id: sym.id, text: `${sym.kind} ${sym.name}: ${sym.signature}` });
+      }
 
       manifest.files[f.relPath] = { hash: f.hash, mtime: f.mtime };
       processedCount++;
-      if (processedCount % 25 === 0) onProgress(`  ...processed ${processedCount}/${toProcess.length}`);
+      if (processedCount % 100 === 0 || processedCount === toProcess.length) {
+        const pct = ((processedCount / toProcess.length) * 100).toFixed(0);
+        onProgress(`  ...parsed ${processedCount}/${toProcess.length} files (${pct}%)`);
+      }
+    }
+    if (toProcess.length) {
+      onProgress(`Parsed ${toProcess.length} files in ${((Date.now() - parseT0) / 1000).toFixed(1)}s`);
     }
 
     // Resolve call edges only now that every file in this pass has its
@@ -116,6 +130,22 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
     // time. That's most of a fresh/forced build, not an edge case.
     for (const { fileId, calls } of pendingCallEdges) {
       store.insertCallEdges(fileId, calls);
+    }
+
+    // One global batched embedding pass - see the comment above pendingEmbeds
+    // for why this replaces the old one-batch-per-file loop.
+    const EMBED_BATCH_SIZE = 256;
+    const embedT0 = Date.now();
+    for (let i = 0; i < pendingEmbeds.length; i += EMBED_BATCH_SIZE) {
+      const batch = pendingEmbeds.slice(i, i + EMBED_BATCH_SIZE);
+      const vecs = await embedBatch(batch.map((b) => b.text));
+      vectorIndex.addBatch(batch.map((b, j) => [b.id, vecs[j]]));
+      const done = Math.min(i + EMBED_BATCH_SIZE, pendingEmbeds.length);
+      const pct = pendingEmbeds.length ? ((done / pendingEmbeds.length) * 100).toFixed(0) : 100;
+      onProgress(`  ...embedded ${done}/${pendingEmbeds.length} symbols (${pct}%)`);
+    }
+    if (pendingEmbeds.length) {
+      onProgress(`Embedded ${pendingEmbeds.length} symbols in ${((Date.now() - embedT0) / 1000).toFixed(1)}s`);
     }
 
     // Optional precision pass: opt-in (`--precise`) because it depends on an
@@ -133,15 +163,20 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
 
     vectorIndex.save();
 
+    const totalSymbols = store.countSymbols();
+
     manifest.rootDir = root;
     manifest.builtAt = new Date().toISOString();
     manifest.repoId = repoId;
     manifest.contentVersion = CONTENT_VERSION;
+    // Cheap to read back later (see config.js's summarizeManifest/
+    // listAllRepoBrains) without opening graph.sqlite just to answer "how
+    // big is this brain" for a listing.
+    manifest.stats = { filesTotal: walked.length, symbols: totalSymbols, vectors: vectorIndex.size };
     writeManifest(brainDir, manifest);
 
     if (instructions) writeInstructions(root, brainDir, repoId);
 
-    const totalSymbols = store.countSymbols();
     onProgress(`Done. ${totalSymbols} symbols indexed. Vector index size: ${vectorIndex.size}`);
     // vectorIndex.js documents a ~200k-symbol design ceiling for its
     // brute-force cosine search (no ANN structure) - warn well before that,

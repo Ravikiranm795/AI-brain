@@ -137,6 +137,27 @@ function parseFile(absPath, ext, source) {
         for (const child of node.namedChildren) visit(child);
         return;
       }
+      // JS/TS: `new Foo(...)` - tracked as a call to `Foo` so a class picks
+      // up a direct incoming edge from wherever it's constructed, not just
+      // from callers of its methods (see graphStore.js's getClassMembers doc
+      // comment for why a class otherwise has almost no edges of its own).
+      // Only the plain-identifier constructor shape is handled (`new Foo()`),
+      // same as every other call-site handler here - `new ns.Foo()` is
+      // skipped rather than guessed at.
+      case 'new_expression': {
+        const ctorNode = node.childForFieldName('constructor');
+        const scope = currentScope();
+        if (ctorNode && ctorNode.type === 'identifier' && scope) {
+          calls.push({
+            callerName: scope.name,
+            calleeName: ctorNode.text,
+            line: node.startPosition.row + 1,
+            calleeLine: ctorNode.startPosition.row,
+            calleeColumn: ctorNode.startPosition.column
+          });
+        }
+        break;
+      }
       // Python: function_definition covers both top-level functions and
       // methods (there's no separate method_definition node type like JS) -
       // it's a method only when its immediate containing block belongs to a
@@ -233,6 +254,47 @@ function parseFile(absPath, ext, source) {
         for (const child of node.namedChildren) visit(child);
         scopeStack.pop();
         return;
+      }
+      // Java, C# and PHP all name this node type `object_creation_expression`
+      // (harmless collision - a given parse only ever runs one grammar), but
+      // shape it differently: Java/C# expose a `type` field (`type_identifier`
+      // vs. plain `identifier`), while PHP has no field name at all - the
+      // class being constructed is just the first named child, either a
+      // plain `name` or (for `new \Ns\Foo()`) a `qualified_name` whose text
+      // includes the leading namespace, so only the final segment after the
+      // last backslash is used, to match how the class itself got indexed
+      // (see pushSymbol - it stores the bare class name). See the JS
+      // new_expression case above for why this matters for a class's blast
+      // radius. Generic/qualified forms (`new List<Foo>()`, `new ns.Foo()`)
+      // are skipped rather than guessed at, same policy as every other
+      // call-site handler here.
+      case 'object_creation_expression': {
+        const scope = currentScope();
+        if (!scope) break;
+        const typeNode = node.childForFieldName('type');
+        let calleeName = null;
+        let calleeNode = null;
+        if (typeNode && (typeNode.type === 'type_identifier' || typeNode.type === 'identifier')) {
+          calleeName = typeNode.text;
+          calleeNode = typeNode;
+        } else if (!typeNode) {
+          const target = node.namedChild(0);
+          if (target && (target.type === 'name' || target.type === 'qualified_name')) {
+            const segments = target.text.split('\\');
+            calleeName = segments[segments.length - 1] || null;
+            calleeNode = target;
+          }
+        }
+        if (calleeName) {
+          calls.push({
+            callerName: scope.name,
+            calleeName,
+            line: node.startPosition.row + 1,
+            calleeLine: calleeNode.startPosition.row,
+            calleeColumn: calleeNode.startPosition.column
+          });
+        }
+        break;
       }
       // Java: method_invocation carries a clean `name` field regardless of
       // whether it's called on an object (`obj.method()`) or bare

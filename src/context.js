@@ -126,8 +126,12 @@ async function buildContext(rootDir, taskText, opts = {}, deps = {}) {
     const hop1 = [];
     const hop2plus = [];
 
+    let unresolvedClassHit = null;
     for (const hit of primaryHits) {
-      const related = store.expand(hit.symbolId, hops);
+      const { items: related, meta } = store.expand(hit.symbolId, hops);
+      if (meta.classAggregation && meta.classAggregation.unresolved && !unresolvedClassHit) {
+        unresolvedClassHit = hit;
+      }
       for (const r of related) {
         if (!r.symbol || seen.has(r.symbolId)) continue;
         seen.add(r.symbolId);
@@ -216,6 +220,12 @@ async function buildContext(rootDir, taskText, opts = {}, deps = {}) {
     }
     if (droppedForRelevance > 0) {
       notes.push(`${droppedForRelevance} neighbor(s) omitted (below the ${minNeighborSimilarity} relevance-to-task similarity floor)`);
+    }
+    if (unresolvedClassHit) {
+      notes.push(
+        `"${unresolvedClassHit.name}" (${unresolvedClassHit.path}) is a class/interface with no discoverable members ` +
+        `(e.g. a TS interface) - its neighbors could not actually be resolved, so a thin neighborhood here doesn't mean it's unused.`
+      );
     }
 
     // usedChars tracks a running estimate (per-item JSON size) so the code-

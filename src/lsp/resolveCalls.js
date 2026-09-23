@@ -109,8 +109,17 @@ async function resolvePreciseCallEdges(rootDir, store, filesWithCalls, onProgres
               if (!targetFile) continue;
 
               const targetLine = loc.range.start.line + 1; // LSP is 0-indexed; this schema's start_line/end_line are 1-indexed
+              // A method's line range is also inside its enclosing class's
+              // range, so an unordered query here can just as easily return
+              // the class as the actual method the definition points at -
+              // ordering by the smallest containing range picks the most
+              // specific (innermost) symbol, which is what a "go to
+              // definition" answer actually means.
               const dst = store.db
-                .prepare('SELECT id FROM symbols WHERE file_id = ? AND start_line <= ? AND end_line >= ?')
+                .prepare(
+                  `SELECT id FROM symbols WHERE file_id = ? AND start_line <= ? AND end_line >= ?
+                   ORDER BY (end_line - start_line) ASC LIMIT 1`
+                )
                 .get(targetFile.id, targetLine, targetLine);
               if (!dst) continue;
 
