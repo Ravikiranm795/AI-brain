@@ -10,7 +10,12 @@ const path = require('path');
 // contentVersion and forces one full rebuild when they differ, so existing
 // indexed repos pick up the new content shape on their next `brain build`
 // without the user needing to know about `--force`.
-const CONTENT_VERSION = 2;
+// 3: symbols gained parent_name and edges gained tiered `resolution`/
+// `target_count` (see graphStore.js's insertCallEdges), and files over 32KB
+// now actually parse (see parser.js's bufferSize). All three change what is
+// stored per symbol/edge without changing any source file's hash, so an
+// incremental build over a v2 brain would keep serving the old, wrong graph.
+const CONTENT_VERSION = 3;
 
 function manifestPath(brainDir) {
   return path.join(brainDir, 'manifest.json');
