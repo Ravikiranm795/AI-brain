@@ -12,7 +12,8 @@ const { generateVisualizationHtml } = require('../src/visualize');
 const { generateVisualizationHtml2 } = require('../src/visualize2');
 const { generateVisualizationHtml3 } = require('../src/visualize3');
 const { generateExploreHtml } = require('../src/visualizeExplore');
-const { listAllRepoBrains, getBrainsHome, getRepoBrainDir } = require('../src/config');
+const { generateCityViewer } = require('../src/visualizeCity');
+const { listAllRepoBrains, getBrainsHome } = require('../src/config');
 
 const program = new Command();
 
@@ -182,6 +183,24 @@ program
     if (opts.open) {
       const open = (await import('open')).default;
       await open(outPath);
+    }
+  });
+
+program
+  .command('view')
+  .description('Open the 3D model viewer. Reads one shared data folder; keeps the latest two builds of each repo so you can switch between them')
+  .option('--open', 'open in the default browser after generating', true)
+  .option('--no-open', 'only write the files')
+  .action(async (opts) => {
+    const out = generateCityViewer({ onProgress: (m) => console.log(m) });
+    console.log(`Viewer: ${out.indexHtml}`);
+    for (const r of out.repos) {
+      const builds = r.versions.length ? r.versions.map((v, i) => `${i === 0 ? 'latest' : 'previous'} ${v.id} (${v.symbols} symbols)`).join(', ') : 'not indexed yet - run "brain build"';
+      console.log(`  ${r.name}: ${builds}`);
+    }
+    if (opts.open) {
+      const open = (await import('open')).default;
+      await open(out.indexHtml);
     }
   });
 

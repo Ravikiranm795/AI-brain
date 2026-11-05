@@ -255,13 +255,26 @@ brain-mcp
 
 ## 6. Visualizing the graph
 
+### `brain view` — the 3D model (start here)
+
+```bash
+brain view          # writes the viewer and opens it in your browser
+brain view --no-open
+```
+
+A scale model of the repo: each folder is a district, each file a plot, each function / method / class a block on its file's plot. Block height shows size, callers or calls (your choice). Select a block to see who calls it and what it calls as arcs that draw on in the direction of the call (orange = it calls, blue = calls it). Search with `/`, fly to anything, filter by kind, hide weak links, and follow links 1-3 steps. Press `?` in the viewer for the full list of controls. It works from disk with no server, on desktop and phone, in light or dark.
+
+**Two builds per repo.** Every `brain build` saves a snapshot of the graph; the **two most recent** are kept per repo and offered in the *Build* dropdown as *Latest* and *Previous*. **Highlight changes** (or `C`) compares them: symbols that exist only in the build you are looking at glow and rise from the ground, and the panel lists what is missing from it. Older snapshots are deleted automatically.
+
+**One data folder.** Every viewer — this one and all of the ones below — reads the same snapshots from `<BRAIN_HOME>/viz-data/`, so they always agree and you never wait for a 40 MB page to parse. Snapshots are refreshed on every `brain build` and again each time you run a viewer command.
+
 ### `brain explore` — start from one function, walk outward
 
 ```bash
 brain explore --open
 ```
 
-The other three visualizers below render the *entire* graph as one force-directed layout, which gets unreadable fast on a real-sized repo. `brain explore` instead starts from nothing: search for a function/class/file (or pick one of the suggested most-connected symbols), and it renders only that symbol's immediate neighborhood (1-2 hops, your choice). Click any neighbor to re-center the view on it, with a Back button to retrace your steps. This is the one to reach for on anything past a small repo.
+The other visualizers below render the *entire* graph as one force-directed layout, which gets unreadable fast on a real-sized repo. `brain explore` instead starts from nothing: search for a function/class/file (or pick one of the suggested most-connected symbols), and it renders only that symbol's immediate neighborhood (1-2 hops, your choice). Click any neighbor to re-center the view on it, with a Back button to retrace your steps. This is the one to reach for on anything past a small repo.
 
 ### `brain visualize` / `visualize2` / `visualize3` — whole-graph views
 
@@ -276,7 +289,7 @@ indexed (not just the current one), with:
 - Edges = call relationships
 - A search box that highlights matching nodes and their connections
 
-`visualize2` is a galaxy-style layout of the same data; `visualize3` is a radial graph-analysis view. Regenerate any of them after a `brain build` to refresh with the latest graph.
+`visualize2` is a galaxy-style layout of the same data; `visualize3` is a radial graph-analysis view. Regenerate any of them after a `brain build` to refresh with the latest graph. They show the latest build only, and load their graph library from a CDN, so they need an internet connection; `brain view` does not.
 
 ---
 
@@ -307,6 +320,10 @@ brain build --precise
     graph.sqlite                 # files, symbols, edges, string_literals, chunks tables + chunks_fts (FTS5 lexical index)
     vectors.bin                   # flat Float32Array of symbol embeddings
     vectors.meta.json              # symbol ids matching vectors.bin order
+  viz-data/                    # the one folder every viewer reads - see §6
+    index.json / index.js       # which repos exist and which builds each has
+    repos/<repo>/<build>.js     # the latest two graph snapshots per repo
+    index.html, app.js, ...     # the 3D viewer written by `brain view`
 ```
 
 A repo can also have its own `brain.config.json` at its root (repo-specific overrides — see §2).

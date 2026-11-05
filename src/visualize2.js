@@ -1,28 +1,18 @@
 'use strict';
 
 const fs = require('fs');
-const path = require('path');
-const { GraphStore } = require('./graphStore');
-const { listAllRepoBrains } = require('./config');
+const { latestGraphs } = require('./vizData');
 const { buildCytoscapeElements } = require('./visualize');
 
 function generateVisualizationHtml2(outPath) {
-  const repos = listAllRepoBrains();
   const repoData = {};
 
-  for (const r of repos) {
-    if (!fs.existsSync(path.join(r.dir, 'graph.sqlite'))) continue;
-    const store = new GraphStore(r.dir);
-    try {
-      const graph = store.exportFullGraph();
-      repoData[r.repoId] = {
-        repoId: r.repoId,
-        rootDir: r.manifest ? r.manifest.rootDir : r.repoId,
-        elements: buildCytoscapeElements(graph)
-      };
-    } finally {
-      store.close();
-    }
+  for (const r of latestGraphs()) {
+    repoData[r.repoId] = {
+      repoId: r.repoId,
+      rootDir: r.rootDir,
+      elements: buildCytoscapeElements(r.graph)
+    };
   }
 
   const html = HTML_TEMPLATE.replace('/*__REPO_DATA__*/', JSON.stringify(repoData));

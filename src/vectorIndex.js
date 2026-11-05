@@ -92,20 +92,45 @@ class VectorIndex {
    * an agent actually sees is an RRF score, not this cosine value; see
    * query.js's DEFAULT_RRF_K comment and README §10.
    */
-  search(queryVec, k = 10) {
+  search(queryVec, k = 10, weights = null) {
     const n = this.ids.length;
-    const scores = new Array(n);
+    if (!n || !(k > 0)) return [];
+
+    // Scores go in a Float32Array and the top-k is taken by a single
+    // threshold pass, rather than materializing n [score, id] pairs and
+    // fully sorting them. Same results, but it allocates one typed array
+    // instead of n two-element arrays, and sorts k items instead of n -
+    // the allocation and GC churn of the old shape cost about as much as
+    // the dot products themselves at this repo's size.
+    const scores = new Float32Array(n);
     for (let i = 0; i < n; i++) {
       let dot = 0;
       const base = i * EMBEDDING_DIM;
       for (let d = 0; d < EMBEDDING_DIM; d++) {
         dot += this.vectors[base + d] * queryVec[d];
       }
-      scores[i] = dot; // vectors are pre-normalized -> dot product == cosine similarity
+      // vectors are pre-normalized -> dot product == cosine similarity. `weights` (aligned with
+      // `ids`) scales a positive similarity so e.g. tests can be ranked below the code they test.
+      scores[i] = weights && dot > 0 ? dot * weights[i] : dot;
     }
-    const indexed = scores.map((s, i) => [s, this.ids[i]]);
-    indexed.sort((a, b) => b[0] - a[0]);
-    return indexed.slice(0, k).map(([score, id]) => ({ symbolId: id, score }));
+
+    const limit = Math.min(k, n);
+    const top = []; // ascending by score; top[0] is the weakest kept result
+    for (let i = 0; i < n; i++) {
+      const score = scores[i];
+      if (top.length === limit && score <= top[0].score) continue;
+      // Insert into the sorted-ascending window, then drop the weakest.
+      let lo = 0;
+      let hi = top.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (top[mid].score < score) lo = mid + 1;
+        else hi = mid;
+      }
+      top.splice(lo, 0, { symbolId: this.ids[i], score });
+      if (top.length > limit) top.shift();
+    }
+    return top.reverse();
   }
 
   get size() {

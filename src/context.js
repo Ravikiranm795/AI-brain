@@ -1,8 +1,9 @@
 'use strict';
 
+const path = require('path');
 const { GraphStore } = require('./graphStore');
 const { VectorIndex } = require('./vectorIndex');
-const { getRepoBrainDir, getBrainsHome } = require('./config');
+const { getRepoBrainDir, getBrainsHome, PRESENTATION_EXTENSIONS, isGenericallyParsed } = require('./config');
 const { loadUserConfig } = require('./userConfig');
 const query = require('./query');
 
@@ -10,6 +11,53 @@ const DEFAULT_K = 8;
 const DEFAULT_HOPS = 1;
 const DEFAULT_BUDGET_CHARS = 24000;
 const MAX_ITEMS = 60;
+
+// --- Context-assembly re-ranking (see contextRelevanceWeight) -------------
+//
+// brain_search returns hits ranked purely by relevance, which is right for
+// search. brain_context is different: it spends a fixed char budget reading
+// real source, in priority order, and stops when the budget runs out. So
+// what matters there isn't only "does this match" but "is this worth
+// spending the budget on" - and a whole-file SCSS blob that matched on the
+// component's name is not, even when it legitimately scores well.
+//
+// These multiply the search score to produce the ordering the budget loop
+// consumes. They only ever reorder: nothing is filtered out, so a query
+// genuinely about styles still gets its stylesheet, just not ahead of the
+// logic.
+
+// By symbol kind. 'file' is the generic whole-file chunk (see parser.js's
+// parseGenericFile) - the single biggest budget risk, since one such item
+// can be thousands of characters.
+const KIND_WEIGHT = {
+  method: 1,
+  function: 1,
+  class: 0.95,
+  test: 0.6,
+  suite: 0.55,
+  hook: 0.5,
+  file: 0.2
+};
+
+// By file extension, on top of kind. Presentation files are penalized
+// hardest; other generically-parsed files (config, data, markup) sit
+// between them and real parsed source.
+const PRESENTATION_WEIGHT = 0.25;
+const GENERIC_WEIGHT = 0.6;
+
+/**
+ * Combined priority multiplier for one search hit. Bounded well above zero
+ * so this stays a re-ranking, not a filter - an item that is genuinely the
+ * only match still surfaces.
+ */
+function contextRelevanceWeight(item) {
+  const kindWeight = KIND_WEIGHT[item.kind] != null ? KIND_WEIGHT[item.kind] : 0.8;
+  const ext = item.path ? path.extname(item.path).toLowerCase() : '';
+  let extWeight = 1;
+  if (PRESENTATION_EXTENSIONS.has(ext)) extWeight = PRESENTATION_WEIGHT;
+  else if (ext && isGenericallyParsed(ext)) extWeight = GENERIC_WEIGHT;
+  return kindWeight * extWeight;
+}
 
 /**
  * One-shot context assembly for an agent: search -> expand -> read,
@@ -40,7 +88,17 @@ async function buildContext(rootDir, taskText, opts = {}, deps = {}) {
   const shouldClose = !deps.store;
 
   try {
-    const primaryHits = await query.search(rootDir, taskText, k, { kind, ext }, { store, vectorIndex });
+    const searchHits = await query.search(rootDir, taskText, k, { kind, ext }, { store, vectorIndex });
+
+    // Re-rank before anything downstream reads the order: primaryHits[0]
+    // decides which neighborhood gets the hop1 tier below, and the budget
+    // loop spends its allowance strictly in this order. Sorting here is the
+    // whole of fix "presentation files eat the budget" - see
+    // contextRelevanceWeight.
+    const primaryHits = searchHits
+      .map((h) => ({ ...h, contextWeight: contextRelevanceWeight(h) }))
+      .map((h) => ({ ...h, contextScore: h.score * h.contextWeight }))
+      .sort((a, b) => b.contextScore - a.contextScore);
 
     const seen = new Set(primaryHits.map((h) => h.symbolId));
     const hop1 = [];
@@ -104,7 +162,18 @@ async function buildContext(rootDir, taskText, opts = {}, deps = {}) {
     const neighbors = [];
     const filesTouched = new Set();
 
+    let neighborsDropped = 0;
+
     for (const item of priorityOrder) {
+      // A neighbor is metadata-only once the budget is spent, and past that
+      // it isn't worth its own ~200 chars either. Primary hits are the
+      // answer, so they are never dropped - only their code is.
+      if (item.tier !== 'primary' && usedChars >= budgetChars) {
+        neighborsDropped++;
+        truncated = true;
+        continue;
+      }
+
       if (item.path) filesTouched.add(item.path);
 
       const wantsCode = item.tier !== 'hop2plus';
@@ -140,11 +209,25 @@ async function buildContext(rootDir, taskText, opts = {}, deps = {}) {
         code
       };
 
-      if (item.tier === 'primary') {
-        primary.push({ ...base, score: item.score });
-      } else {
-        neighbors.push({ ...base, relation: item.relation, via: item.via });
-      }
+      const entry =
+        item.tier === 'primary'
+          ? { ...base, score: item.score }
+          : { ...base, relation: item.relation, via: item.via };
+
+      // Metadata is charged to the budget too. Previously only `code`
+      // counted, so a bundle with 60 neighbors could return well past its
+      // stated limit in pure metadata - the budget described one part of
+      // the response while the agent paid for all of it. `code` is excluded
+      // here because it was already charged when it was read above;
+      // counting it again would halve the effective budget.
+      usedChars += JSON.stringify({ ...entry, code: null }).length;
+
+      if (item.tier === 'primary') primary.push(entry);
+      else neighbors.push(entry);
+    }
+
+    if (neighborsDropped) {
+      notes.push(`${neighborsDropped} lower-priority neighbors dropped (char budget exhausted)`);
     }
 
     const response = {

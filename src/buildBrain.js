@@ -11,6 +11,8 @@ const { VectorIndex } = require('./vectorIndex');
 const { readManifest, writeManifest, diffAgainstManifest, CONTENT_VERSION } = require('./manifest');
 const { getRepoBrainDir, getRepoId, VECTOR_INDEX_WARN_THRESHOLD } = require('./config');
 const { writeInstructions } = require('./instructions');
+const { snapshotFromStore } = require('./vizData');
+const { embeddingText } = require('./identifiers');
 
 async function buildBrain(rootDir, { onProgress = () => {}, force = false, precise = false, instructions = true } = {}) {
   const root = path.resolve(rootDir);
@@ -98,8 +100,10 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
 
       // Embed this file's new symbols in one batched forward pass instead
       // of one await per symbol - see embedder.js's embedBatch().
-      const symbolRows = store.db.prepare('SELECT id, name, kind, signature FROM symbols WHERE file_id = ?').all(fileId);
-      const texts = symbolRows.map((sym) => `${sym.kind} ${sym.name}: ${sym.signature}`);
+      const symbolRows = store.db
+        .prepare('SELECT s.id, s.name, s.kind, s.signature, c.summary AS doc FROM symbols s LEFT JOIN chunks c ON c.symbol_id = s.id WHERE s.file_id = ?')
+        .all(fileId);
+      const texts = symbolRows.map((sym) => embeddingText(sym, f.relPath));
       const vecs = await embedBatch(texts);
       const pairs = symbolRows.map((sym, i) => [sym.id, vecs[i]]);
       if (pairs.length) vectorIndex.addBatch(pairs);
@@ -140,6 +144,16 @@ async function buildBrain(rootDir, { onProgress = () => {}, force = false, preci
     writeManifest(brainDir, manifest);
 
     if (instructions) writeInstructions(root, brainDir, repoId);
+
+    // Record this build as the repo's newest viewer snapshot (the viewers'
+    // single data source - see vizData.js). A failure here must never fail
+    // the build: the snapshot is derived data and `brain view` re-creates it.
+    try {
+      const snap = snapshotFromStore(store, { repoId, rootDir: root, builtAt: manifest.builtAt });
+      if (snap.created) onProgress(`Viewer snapshot saved (${snap.versionId}).`);
+    } catch (err) {
+      onProgress(`Viewer snapshot skipped: ${err.message}`);
+    }
 
     const totalSymbols = store.countSymbols();
     onProgress(`Done. ${totalSymbols} symbols indexed. Vector index size: ${vectorIndex.size}`);

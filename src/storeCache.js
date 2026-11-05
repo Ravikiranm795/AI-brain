@@ -1,5 +1,6 @@
 'use strict';
 
+const path = require('path');
 const { GraphStore } = require('./graphStore');
 const { VectorIndex } = require('./vectorIndex');
 const { getBrainsHome } = require('./config');
@@ -24,11 +25,27 @@ class StoreCache {
     this.maxOpen = userCfg.maxOpen || DEFAULT_MAX_OPEN;
   }
 
+  /**
+   * Cache keys are canonicalized the same way repo roots are (see
+   * config.js's canonicalizeRootPath): the map key has to be one spelling
+   * per brain directory, or two calls in one session that differ only in
+   * casing/separator open two independent GraphStore handles onto the same
+   * sqlite file - doubling the handle count the LRU cap is there to bound,
+   * and letting one call's writes go unseen by the other's already-loaded
+   * VectorIndex.
+   */
+  _key(brainDir) {
+    let key = path.resolve(brainDir);
+    if (key.length > 1) key = key.replace(/[\\/]+$/, '');
+    return process.platform === 'win32' ? key.toLowerCase() : key;
+  }
+
   get(brainDir) {
-    let entry = this.entries.get(brainDir);
+    const key = this._key(brainDir);
+    let entry = this.entries.get(key);
     if (!entry) {
       entry = { store: new GraphStore(brainDir), vectorIndex: new VectorIndex(brainDir) };
-      this.entries.set(brainDir, entry);
+      this.entries.set(key, entry);
       this._evictLeastRecentlyUsedIfOverCap();
     }
     entry.lastUsed = Date.now();
@@ -43,10 +60,11 @@ class StoreCache {
    * it).
    */
   evict(brainDir) {
-    const entry = this.entries.get(brainDir);
+    const key = this._key(brainDir);
+    const entry = this.entries.get(key);
     if (entry) {
       entry.store.close();
-      this.entries.delete(brainDir);
+      this.entries.delete(key);
     }
   }
 

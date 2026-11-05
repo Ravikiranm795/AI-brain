@@ -10,7 +10,7 @@ const path = require('path');
 // contentVersion and forces one full rebuild when they differ, so existing
 // indexed repos pick up the new content shape on their next `brain build`
 // without the user needing to know about `--force`.
-const CONTENT_VERSION = 2;
+const CONTENT_VERSION = 3; // 3: symbols carry their leading doc comment; embeddings include file-path words and the comment
 
 function manifestPath(brainDir) {
   return path.join(brainDir, 'manifest.json');

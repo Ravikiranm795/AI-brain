@@ -16,6 +16,7 @@ const Php = require('tree-sitter-php').php;
 // minified-but-not-.min-named file, a generated 10k-line class) without
 // meaningfully truncating the vast majority of real functions/methods.
 const MAX_CHUNK_CHARS = 20000;
+const MAX_DOC_CHARS = 500; // a symbol's leading comment, kept for search and embeddings
 
 // Extensions with a real tree-sitter grammar wired into the visitor below.
 // Anything else falls back to parseGenericFile (whole-file chunk, no
@@ -94,6 +95,34 @@ function parseFile(absPath, ext, source) {
     return code.slice(node.startIndex, node.endIndex).slice(0, MAX_CHUNK_CHARS);
   }
 
+  // The comment block directly above a symbol (JSDoc, Javadoc, // runs). It
+  // usually says in plain words what the code is for, which is exactly the
+  // vocabulary a plain-English question uses and the code itself lacks.
+  // `export class X` and decorated definitions wrap the symbol node, so the
+  // comment is a sibling of the wrapper, not of the symbol.
+  function leadingDoc(node) {
+    let anchor = node;
+    while (anchor.parent && (anchor.parent.type === 'export_statement' || anchor.parent.type === 'decorated_definition')) {
+      anchor = anchor.parent;
+    }
+    const parts = [];
+    let prev = anchor.previousSibling;
+    let nextRow = anchor.startPosition.row;
+    while (prev && /comment/.test(prev.type) && nextRow - prev.endPosition.row <= 1 && parts.length < 8) {
+      parts.unshift(prev.text);
+      nextRow = prev.startPosition.row;
+      prev = prev.previousSibling;
+    }
+    if (!parts.length) return '';
+    return parts
+      .join(' ')
+      .replace(/\/\*+|\*+\/|^\s*\*+|\s\*+\s|\/\/+|^\s*#+/g, ' ')
+      .replace(/@[a-z]+/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, MAX_DOC_CHARS);
+  }
+
   function pushSymbol(node, name, kind) {
     const sym = {
       name,
@@ -103,7 +132,8 @@ function parseFile(absPath, ext, source) {
       startByte: node.startIndex,
       endByte: node.endIndex,
       signature: nodeSig(node, name),
-      body: nodeBody(node)
+      body: nodeBody(node),
+      doc: leadingDoc(node)
     };
     symbols.push(sym);
     return sym;
