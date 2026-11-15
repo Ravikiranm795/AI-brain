@@ -1,9 +1,7 @@
 'use strict';
 
 const fs = require('fs');
-const path = require('path');
-const { GraphStore } = require('./graphStore');
-const { listAllRepoBrains, getBrainsHome } = require('./config');
+const { latestGraphs } = require('./vizData');
 
 /**
  * Builds a compound (nested) element set: file -> class -> method, so the
@@ -88,22 +86,15 @@ function buildCytoscapeElements(graph) {
 }
 
 function generateVisualizationHtml(outPath) {
-  const repos = listAllRepoBrains();
   const repoData = {};
 
-  for (const r of repos) {
-    if (!fs.existsSync(path.join(r.dir, 'graph.sqlite'))) continue;
-    const store = new GraphStore(r.dir);
-    try {
-      const graph = store.exportFullGraph();
-      repoData[r.repoId] = {
-        repoId: r.repoId,
-        rootDir: r.manifest ? r.manifest.rootDir : r.repoId,
-        elements: buildCytoscapeElements(graph)
-      };
-    } finally {
-      store.close();
-    }
+  // Every viewer reads the shared snapshots (see vizData.js), not the live databases.
+  for (const r of latestGraphs()) {
+    repoData[r.repoId] = {
+      repoId: r.repoId,
+      rootDir: r.rootDir,
+      elements: buildCytoscapeElements(r.graph)
+    };
   }
 
   const html = HTML_TEMPLATE.replace('/*__REPO_DATA__*/', JSON.stringify(repoData));

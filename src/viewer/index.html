@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Brain model</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<a class="skip" href="#search">Skip to search</a>
+<h1 class="sr">Brain model: a 3D map of a code repository</h1>
+
+<canvas id="stage" role="img" aria-label="3D model of the repository. Use the search box or the symbol lists to move through it with the keyboard."></canvas>
+<div id="labels" aria-hidden="true"></div>
+<div id="tip" class="tip" aria-hidden="true" hidden></div>
+
+<div id="left">
+<header id="picker" class="panel">
+  <div class="brand">
+    <svg class="mark" viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M3 20V11l5-3v12M10 20V5l6-2v17M18 20v-8l3 1.5V20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></svg>
+    <span>Brain model</span>
+  </div>
+  <div class="field">
+    <label for="repo">Repository</label>
+    <select id="repo"></select>
+  </div>
+  <div class="field">
+    <label for="version">Build</label>
+    <select id="version"></select>
+  </div>
+  <button id="compare" class="btn toggle" type="button" aria-pressed="false" disabled>
+    <span class="btn-label">Highlight changes</span>
+  </button>
+  <p id="compare-note" class="note" hidden></p>
+</header>
+
+<div id="searchbox" class="searchbox" role="search">
+  <svg class="mag" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M15.5 15.5 21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+  <!-- [html-validate-disable prefer-native-element: ARIA combobox pattern - a text input that owns a listbox of results] -->
+  <input id="search" type="search" autocomplete="off" spellcheck="false" placeholder="Find a function, class or file"
+         role="combobox" aria-expanded="false" aria-controls="results" aria-autocomplete="list" aria-label="Find a symbol">
+  <kbd class="hint" aria-hidden="true">/</kbd>
+  <ul id="results" role="listbox" aria-label="Matching symbols" hidden></ul>
+  <!-- [html-validate-enable prefer-native-element] -->
+</div>
+
+<div id="toolbar" class="toolbar">
+  <button id="btn-tilt" class="icon-btn" type="button" aria-pressed="false" title="Top-down view (T)">
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M4 9l8-4 8 4-8 4-8-4zM4 14l8 4 8-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></svg>
+    <span class="sr">Top-down view</span>
+  </button>
+  <button id="btn-reset" class="icon-btn" type="button" title="Reset view (R)">
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M5 12a7 7 0 1 0 2.2-5.1M5 4v4h4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span class="sr">Reset view</span>
+  </button>
+  <button id="btn-opts" class="icon-btn small-only" type="button" aria-pressed="false" aria-controls="controls" title="View options">
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 5v4M6 15v4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+    <span class="sr">View options</span>
+  </button>
+  <button id="btn-theme" class="icon-btn" type="button" title="Switch light or dark">
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+    <span class="sr">Switch theme</span>
+  </button>
+  <button id="btn-help" class="icon-btn" type="button" title="How to read this (?)">
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9.5 9.3a2.6 2.6 0 0 1 5 .9c0 1.7-2.5 2-2.5 3.6M12 17h.01" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+    <span class="sr">Help</span>
+  </button>
+</div>
+
+<aside id="inspector" class="panel" aria-label="Details" tabindex="-1">
+  <button id="sheet-toggle" class="sheet-toggle" type="button" aria-expanded="true" aria-controls="inspector-body">Details</button>
+  <div id="inspector-body"></div>
+</aside>
+
+<section id="controls" class="panel" aria-label="View options">
+  <details id="controls-details" open>
+    <summary>View options</summary>
+    <fieldset class="seg">
+      <legend>Block height shows</legend>
+      <label><input type="radio" name="height" value="lines" checked><span>Size</span></label>
+      <label><input type="radio" name="height" value="callers"><span>Callers</span></label>
+      <label><input type="radio" name="height" value="callees"><span>Calls</span></label>
+    </fieldset>
+    <div class="slider">
+      <div class="slider-h"><label for="strength">Hide weak links</label><output id="strength-out" for="strength">20%</output></div>
+      <input id="strength" type="range" min="0" max="100" value="20" aria-describedby="strength-help">
+      <p id="strength-help" class="note">Links found by matching a name that many symbols share (get, toString) are weak. Lower this to see them.</p>
+    </div>
+    <div class="slider">
+      <label class="check"><input id="top-on" type="checkbox"><span>Show the strongest links across files</span></label>
+      <input id="top-count" type="range" min="20" max="800" value="200" step="20" aria-label="How many links to show">
+    </div>
+    <div class="slider">
+      <div class="slider-h"><label for="hops">Follow links</label><output id="hops-out" for="hops">1 step</output></div>
+      <input id="hops" type="range" min="1" max="3" value="1">
+    </div>
+    <fieldset class="kinds">
+      <legend>Show</legend>
+      <div id="kinds"></div>
+    </fieldset>
+    <button id="opts-close" class="btn primary small-only" type="button">Done</button>
+  </details>
+</section>
+</div>
+
+<div id="overlay" class="overlay" role="status" aria-live="polite">
+  <div class="card">
+    <div class="spinner" aria-hidden="true"></div>
+    <p id="overlay-title" class="card-title">Opening the model</p>
+    <p id="overlay-text" class="card-text"></p>
+    <div id="overlay-actions"></div>
+  </div>
+</div>
+
+<div id="live" class="sr" role="status" aria-live="polite"></div>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+<dialog id="help" aria-labelledby="help-title">
+  <form method="dialog">
+    <h2 id="help-title">Reading the model</h2>
+    <div class="help-grid">
+      <section>
+        <h3>What you are looking at</h3>
+        <ul>
+          <li>Each <b>district</b> is a folder. Each <b>plot</b> is a file.</li>
+          <li>Each <b>block</b> is a function, method or class. Its height is the measure you pick under View options.</li>
+          <li>Colour is the kind of symbol. Select a block to see who calls it and what it calls.</li>
+          <li><b class="out-word">Orange arcs</b> leave the selected block: what it calls. <b class="in-word">Blue arcs</b> arrive at it: who calls it. They draw on in the direction of the call.</li>
+        </ul>
+      </section>
+      <section>
+        <h3>Moving around</h3>
+        <dl class="keys">
+          <dt>Drag</dt><dd>Turn the model</dd>
+          <dt>Right-drag, or Shift and drag</dt><dd>Slide across it</dd>
+          <dt>Scroll, or pinch</dt><dd>Zoom</dd>
+          <dt>Double-click</dt><dd>Fly to a block</dd>
+          <dt><kbd>/</kbd></dt><dd>Search</dd>
+          <dt><kbd>Esc</kbd></dt><dd>Clear the selection</dd>
+          <dt><kbd>[</kbd></dt><dd>Back to the previous selection</dd>
+          <dt><kbd>T</kbd> and <kbd>R</kbd></dt><dd>Top-down view, reset view</dd>
+          <dt><kbd>C</kbd></dt><dd>Highlight changes between builds</dd>
+          <dt>Arrow keys, <kbd>+</kbd>, <kbd>-</kbd></dt><dd>Slide and zoom</dd>
+        </dl>
+      </section>
+    </div>
+    <button class="btn primary" type="submit" value="close">Got it</button>
+  </form>
+</dialog>
+
+<script src="vendor/three.min.js"></script>
+<script src="index.js"></script>
+<script src="core.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

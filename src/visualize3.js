@@ -2,8 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { GraphStore } = require('./graphStore');
-const { listAllRepoBrains } = require('./config');
+const { latestGraphs } = require('./vizData');
 
 /**
  * Builds a flat node/edge model for the dashboard viewer (unlike visualize.js's
@@ -86,25 +85,17 @@ function buildRadialGraph(graph) {
 }
 
 function generateVisualizationHtml3(outPath) {
-  const repos = listAllRepoBrains();
   const repoData = {};
 
-  for (const r of repos) {
-    if (!fs.existsSync(path.join(r.dir, 'graph.sqlite'))) continue;
-    const store = new GraphStore(r.dir);
-    try {
-      const graph = store.exportFullGraph();
-      const { nodes, edges } = buildRadialGraph(graph);
-      repoData[r.repoId] = {
-        repoId: r.repoId,
-        rootDir: r.manifest ? r.manifest.rootDir : r.repoId,
-        builtAt: r.manifest ? r.manifest.builtAt : null,
-        nodes,
-        edges
-      };
-    } finally {
-      store.close();
-    }
+  for (const r of latestGraphs()) {
+    const { nodes, edges } = buildRadialGraph(r.graph);
+    repoData[r.repoId] = {
+      repoId: r.repoId,
+      rootDir: r.rootDir,
+      builtAt: r.builtAt,
+      nodes,
+      edges
+    };
   }
 
   const html = HTML_TEMPLATE
