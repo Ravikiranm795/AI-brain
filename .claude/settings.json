@@ -1,0 +1,44 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR}/.claude/devsarathi/hooks/ds-hook.js\" session-start",
+            "shell": "bash",
+            "timeout": 20,
+            "statusMessage": "DevSarathi status"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR}/.claude/devsarathi/hooks/ds-hook.js\" prompt",
+            "shell": "bash",
+            "timeout": 10,
+            "statusMessage": "DevSarathi"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR}/.claude/devsarathi/hooks/ds-hook.js\" stop",
+            "shell": "bash",
+            "timeout": 20,
+            "statusMessage": "DevSarathi"
+          }
+        ]
+      }
+    ]
+  }
+}
